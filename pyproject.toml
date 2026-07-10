@@ -116,6 +116,11 @@ markers = [
 [tool.coverage.run]
 branch = true
 source = ["src/webhook_receiver/domain", "src/webhook_receiver/services"]
+# SQLAlchemy's async layer drives our coroutines across greenlet switches
+# (`greenlet_spawn`); without this, coverage silently drops the lines that resume
+# after an `await session.execute(...)` and reports a file as half-covered when
+# an integration test provably ran all of it.
+concurrency = ["greenlet"]
 
 [tool.coverage.report]
 # SPEC 6.10: coverage stays at or above 85% on domain/ and services/.
