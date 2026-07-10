@@ -318,7 +318,7 @@ reject its duplicate.
 
 Architecture decision records live in [`docs/adr/`](docs/adr/) (MADR format):
 
-- **0001** — Postgres-as-queue vs. a dedicated broker *(pending)*
+- **[0001](docs/adr/0001-postgres-as-queue.md)** — Postgres-as-queue vs. a dedicated broker ✅
 - **0002** — Advisory locks for per-entity serialisation *(Day 2)*
 - **0003** — Idempotent effect via a unique-keyed ledger *(Day 2)*
 - **0004** — Retry/backoff parameters and full jitter *(Day 3)*
