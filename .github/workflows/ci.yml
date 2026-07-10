@@ -1,0 +1,150 @@
+# SPEC §6.10: CI is the gate. Lint, types, and tests on every push; a slice is
+# not done until this is green.
+#
+# Stage order is deliberate -- ruff, then mypy, then pytest, then the image
+# build. Each stage costs more than the last, so the cheapest signal fails first.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch makes the previous run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in step with the uv that writes uv.lock. Lockfile revision 3 is
+  # unreadable by uv 0.5.
+  UV_VERSION: "0.11.28"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen --extra dev
+      - name: ruff check
+        run: uv run ruff check --output-format=github .
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+  types:
+    name: mypy --strict
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen --extra dev
+      - run: uv run mypy
+
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen --extra dev
+
+      # ubuntu-latest runners ship a working Docker daemon, so Testcontainers
+      # brings up a real Postgres 16. SPEC §6.5: idempotency, advisory locks and
+      # SKIP LOCKED are database behaviours, and are never mocked.
+      #
+      # ALLOW_SKIP_INTEGRATION is deliberately NOT set here. With Docker absent
+      # the integration suite must fail, not skip: a suite that quietly skips
+      # itself keeps CI green while the guarantees it exists to prove go
+      # unverified. Assert the daemon up front so the failure names itself.
+      - name: Confirm a Docker daemon is available
+        run: docker info > /dev/null
+
+      # Pull once, so the first Testcontainers start does not race its own
+      # image pull against the container start timeout.
+      - name: Pre-pull the Postgres image
+        run: docker pull postgres:16-alpine
+
+      # Enforces `fail_under = 85` on domain/ and services/ from pyproject.toml.
+      - name: Run tests with coverage
+        run: >-
+          uv run pytest
+          --cov --cov-report=term-missing --cov-report=xml
+          -p no:cacheprovider
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
+
+  build:
+    name: image build
+    runs-on: ubuntu-latest
+    # No sense building an image from code that does not lint, type, or pass.
+    needs: [lint, types, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: true
+          tags: webhook-receiver:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A build that merely compiles says nothing about the CMD, the non-root
+      # user, or whether the thing actually serves. Start it and ask.
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+
+          docker run -d --name smoke -p 8000:8000 \
+            -e DATABASE_URL='postgresql+asyncpg://u:p@127.0.0.1:1/nodb' \
+            -e ADMIN_API_KEY='ci-smoke-key' \
+            -e WEBHOOK_SECRETS='{"stripe":"whsec_ci"}' \
+            -e ENVIRONMENT=ci \
+            "webhook-receiver:${{ github.sha }}"
+
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/healthz >/dev/null; then break; fi
+            sleep 1
+          done
+
+          # Liveness must be 200 even though no database is reachable.
+          curl -sf http://127.0.0.1:8000/healthz | grep -q '"alive"' \
+            || { echo "::error::/healthz did not report alive"; docker logs smoke; exit 1; }
+
+          # Readiness must be 503, precisely because no database is reachable.
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/readyz)
+          [ "$code" = "503" ] \
+            || { echo "::error::/readyz returned $code, expected 503"; docker logs smoke; exit 1; }
+
+          # NFR-6: the process must not be root.
+          user=$(docker exec smoke id -un)
+          [ "$user" = "app" ] \
+            || { echo "::error::container runs as '$user', expected 'app'"; exit 1; }
+
+          docker rm -f smoke
