@@ -85,7 +85,7 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header", 
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "migrations"]
 plugins = ["pydantic.mypy"]
 warn_unreachable = true
 warn_unused_ignores = true
@@ -93,12 +93,8 @@ disallow_any_generics = true
 show_error_codes = true
 
 [[tool.mypy.overrides]]
-# Alembic ships partial stubs; its generated env.py is not strictly typeable.
-module = ["alembic.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-# testcontainers has no type information published.
+# testcontainers publishes no py.typed marker. alembic and sqlalchemy both do,
+# so they are checked normally.
 module = ["testcontainers.*"]
 ignore_missing_imports = true
 
