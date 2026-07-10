@@ -10,12 +10,6 @@ background worker applies the business effect exactly once.
 
 The design, requirements, and data model live in [`SPEC.md`](SPEC.md).
 
-> **Status: Day 0 of 4.** Foundation only. `GET /healthz` and `GET /readyz` are live; the full
-> database schema, config, container, and CI are in place. Ingestion (`POST /v1/webhooks/{source}`),
-> the worker, retries, and the DLQ arrive in Days 1–3. See [Status](#status).
-
----
-
 ## What it does
 
 | | |
@@ -173,15 +167,6 @@ tests/
 docs/adr/      architecture decision records
 ```
 
-## Status
-
-| Slice | Delivers | State |
-|---|---|---|
-| Day 0 | Scaffold, schema, config, `/healthz`, `/readyz`, Docker, CI | ✅ Done |
-| Day 1 | `POST /v1/webhooks/{source}`, signature verification, dedup | Not started |
-| Day 2 | Worker, per-entity locking, effect ledger, ordering | Not started |
-| Day 3 | Retries, DLQ, replay, admin API, `/metrics` | Not started |
-| Day 4 | Load test, AWS deploy, `ARCHITECTURE.md`, runbook | Not started |
 
 Endpoints live today: `GET /healthz`, `GET /readyz`.
 
@@ -192,7 +177,3 @@ the design depends on.
 
 - [`SPEC.md`](SPEC.md) — requirements, data model, architecture
 - [`docs/adr/`](docs/adr/) — architecture decision records
-  - [0001](docs/adr/0001-postgres-as-queue.md) — why Postgres is the queue, not a broker
-  - [0006](docs/adr/0006-superseded-attempt-outcome.md) — adding `superseded` to `attempt_outcome`
-- `ARCHITECTURE.md` — how the pieces fit and why (Day 4)
-- `docs/runbook.md` — operational procedures (Day 4)
