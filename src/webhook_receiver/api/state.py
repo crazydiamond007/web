@@ -13,6 +13,7 @@ from typing import Annotated, cast
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from webhook_receiver.adapters.clock import Clock, SystemClock
 from webhook_receiver.config import Settings
 
 STATE_ATTR = "webhook_receiver_state"
@@ -32,3 +33,16 @@ def get_app_state(request: Request) -> AppState:
 
 
 AppStateDep = Annotated[AppState, Depends(get_app_state)]
+
+
+def get_clock() -> Clock:
+    """The application clock (SPEC §6.4).
+
+    A dependency, not a bare `SystemClock()`, so a test can override it through
+    FastAPI and pin `now` -- verifying the endpoint's stale-timestamp path
+    without waiting out the real tolerance window.
+    """
+    return SystemClock()
+
+
+ClockDep = Annotated[Clock, Depends(get_clock)]

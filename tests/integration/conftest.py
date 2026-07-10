@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from alembic import command
 from alembic.config import Config as AlembicConfig
 from testcontainers.postgres import PostgresContainer
 
@@ -53,3 +54,17 @@ def alembic_config(database_url: str) -> AlembicConfig:
     config.cmd_opts = None
     config.attributes["url"] = database_url
     return config
+
+
+@pytest.fixture
+def migrated_schema(alembic_config: AlembicConfig) -> Iterator[None]:
+    """A database at `head`, torn back down to `base` afterwards.
+
+    For suites that exercise the running application rather than the migration
+    itself: they need the schema present and a clean slate between tests.
+    """
+    command.upgrade(alembic_config, "head")
+    try:
+        yield
+    finally:
+        command.downgrade(alembic_config, "base")
