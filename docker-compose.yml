@@ -1,0 +1,85 @@
+# Local topology: postgres + migrate + app + worker.
+#
+# `migrate` is a separate one-shot service, not an app entrypoint step. Two app
+# replicas racing `alembic upgrade head` on boot is a real way to corrupt a
+# schema; running it once, to completion, before anything else starts is not.
+
+name: webhook-receiver
+
+# These are local-development values and no more: the compose stack is not
+# reachable off-host and the "secrets" below sign nothing real. Production
+# supplies all four from the environment (SPEC §NFR-6).
+#
+# WEBHOOK_SECRETS is written literally rather than as ${VAR:-{"..."}} because a
+# `}` inside a Compose default value terminates the interpolation early. Export
+# it in your shell (or a local .env) to override.
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://webhook:webhook@postgres:5432/webhook_receiver
+  ADMIN_API_KEY: ${ADMIN_API_KEY:-local-dev-admin-key}
+  WEBHOOK_SECRETS: '{"stripe":"whsec_local_dev_secret"}'
+  ENVIRONMENT: ${ENVIRONMENT:-local}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: webhook
+      POSTGRES_PASSWORD: webhook
+      POSTGRES_DB: webhook_receiver
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` alone returns true while the server is still doing crash
+      # recovery and refusing connections, so query the actual database.
+      test: ["CMD-SHELL", "pg_isready -U webhook -d webhook_receiver -q"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+  migrate:
+    build:
+      context: .
+      target: runtime
+    environment: *app-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      target: runtime
+    environment: *app-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      target: runtime
+    environment: *app-env
+    command: ["python", "-m", "webhook_receiver.worker.main"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # Scale freely: FOR UPDATE SKIP LOCKED means two workers never claim the
+    # same row, and the advisory lock means they never race on one entity.
+    #   docker compose up --scale worker=4
+
+volumes:
+  postgres-data:
