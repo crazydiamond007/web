@@ -10,6 +10,19 @@ background worker applies the business effect exactly once.
 
 The design, requirements, and data model live in [`SPEC.md`](SPEC.md).
 
+## The number
+
+> **20,910 duplicate deliveries under concurrency. 2,466 distinct events. 2,466 ledger entries.
+> Zero double-processing. Ingestion p99 of 26 ms at 350 deliveries/s.**
+
+88% of that traffic was a redelivery of something already stored — and a redelivery costs exactly as
+much as a first delivery (p99 26 ms vs 27 ms), because deduplication is a single `INSERT ... ON
+CONFLICT`, not a lookup followed by a decision. If the duplicate path were the slow one, a provider
+retrying *during* an incident would deepen the incident.
+
+Reproduce it with `make load`. Method, the full latency curve, and where the ceiling actually is
+(spoiler: the app process, not Postgres) are in [`docs/load-test.md`](docs/load-test.md).
+
 ## What it does
 
 | | |

@@ -8,7 +8,7 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help install env db-up db-down psql db-url migrate dev worker send balance demo \
-        metrics worker-metrics report purge \
+        metrics worker-metrics report purge load load-reset \
         up up-scale down logs test test-unit lint types check fmt
 
 # Compose reads .env automatically; the local targets rely on Settings doing the
@@ -121,6 +121,33 @@ demo: ## The Day 2 story: a duplicate delivery and a reordered one, on one accou
 	@$(MAKE) --no-print-directory balance
 	@echo "balance should be 1000, NOT 50 and NOT 1500;"
 	@echo "ledger_rows should be 2 (one credit, one snapshot delta); the stale snapshot is superseded."
+
+# === The proof (NFR-1, NFR-2) ================================================
+
+# Deliveries to send. Every event goes out TWICE (a provider redelivering what it
+# never got a 200 for), so this is also roughly 2x the number of distinct events.
+LOAD_USERS   ?= 8
+LOAD_TIME    ?= 60s
+LOAD_ACCOUNTS ?= 50
+LOAD_AMOUNT  ?= 100
+
+load: ## The headline: hammer it with duplicates, then prove nothing was applied twice
+	@echo "== firing duplicate deliveries at $(LOAD_ACCOUNTS) accounts for $(LOAD_TIME)"
+	LOAD_ACCOUNTS=$(LOAD_ACCOUNTS) LOAD_AMOUNT=$(LOAD_AMOUNT) \
+		uv run locust -f tests/load/locustfile.py --headless \
+			--users $(LOAD_USERS) --spawn-rate 25 --run-time $(LOAD_TIME) \
+			--host http://localhost:8000 \
+			--csv artifacts/load --csv-full-history --only-summary
+	@echo ""
+	@echo "== now grade it from the DATABASE, not from locust"
+	uv run python scripts/verify_load.py --amount $(LOAD_AMOUNT) \
+		--requests $$(awk -F, '$$2=="Aggregated"{print $$3}' artifacts/load_stats.csv)
+
+load-reset: ## Wipe the load data so a run starts from zero
+	@$(COMPOSE) exec -T postgres psql -U webhook -d webhook_receiver -q -c \
+		"BEGIN; SET LOCAL app.allow_ledger_delete = 'on'; \
+		 DELETE FROM ledger_entry; DELETE FROM webhook_event; DELETE FROM account; COMMIT;"
+	@echo "load data cleared"
 
 # === Docker: the whole stack in containers ===================================
 

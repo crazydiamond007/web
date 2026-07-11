@@ -18,3 +18,4 @@ build/
 *.swp
 .claude
 
+artifacts/
