@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from webhook_receiver.api.signature import SIGNATURE_HEADER, expected_signature
 from webhook_receiver.config import get_settings
@@ -30,10 +31,27 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--url", default="http://localhost:8000", help="Base URL of the app.")
     parser.add_argument("--source", default="stripe", help="The {source} path segment.")
     parser.add_argument("--event-id", default=None, help="Event id (default: time-based).")
-    parser.add_argument("--event-type", default="balance.credited", help="Event type.")
+    parser.add_argument(
+        "--event-type",
+        default="balance.credited",
+        help="balance.credited | balance.debited | balance.snapshot.",
+    )
     parser.add_argument("--entity-type", default="account", help="Entity type.")
     parser.add_argument("--entity-id", default="acct_1", help="Entity id.")
-    parser.add_argument("--amount", type=int, default=500, help="A value for data.amount.")
+    parser.add_argument("--amount", type=int, default=500, help="Minor units to credit or debit.")
+    parser.add_argument(
+        "--balance",
+        type=int,
+        default=1000,
+        help="Absolute balance, for balance.snapshot only.",
+    )
+    parser.add_argument(
+        "--sequence",
+        type=int,
+        default=None,
+        help="Provider ordering key (FR-10). Required by balance.snapshot; send a "
+        "lower one after a higher one to watch a stale event be superseded.",
+    )
     parser.add_argument("--idempotency-key", default=None, help="Override the dedup key.")
     parser.add_argument("--count", type=int, default=1, help="Send the same event N times.")
     parser.add_argument(
@@ -45,14 +63,25 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+SNAPSHOT = "balance.snapshot"
+
+
 def _build_body(args: argparse.Namespace, event_id: str) -> bytes:
-    envelope = {
+    # A snapshot asserts an absolute balance; a credit or debit moves it. The
+    # worker's handlers read different fields for the two, so the sender has to
+    # send the right one.
+    data = {"balance": args.balance} if args.event_type == SNAPSHOT else {"amount": args.amount}
+
+    envelope: dict[str, object] = {
         "id": event_id,
         "type": args.event_type,
         "occurred_at": datetime.now(UTC).isoformat(),
         "entity": {"type": args.entity_type, "id": args.entity_id},
-        "data": {"amount": args.amount},
+        "data": data,
     }
+    if args.sequence is not None:
+        envelope["sequence"] = args.sequence
+
     # Sort keys so the bytes are stable -- the signature covers exactly these.
     return json.dumps(envelope, sort_keys=True).encode("utf-8")
 
@@ -96,9 +125,15 @@ def main() -> int:
         return 1
     secret = secret_value.get_secret_value()
 
-    # A shared event id so repeated sends are the *same* event, not new ones --
-    # that is what exercises the dedup constraint (FR-5).
-    event_id = args.event_id or f"evt_{int(time.time())}"
+    # A shared event id so repeated sends within ONE invocation are the *same*
+    # event -- that is what exercises the dedup constraint (FR-5).
+    #
+    # Random, not `int(time.time())`: a time-based id makes two invocations inside
+    # the same second collide, and the receiver then does exactly what it is built
+    # to do -- treats the second, unrelated event as a redelivery of the first and
+    # discards it. Correct behaviour, wrong events, and a demo that appears to
+    # prove the opposite of what it claims.
+    event_id = args.event_id or f"evt_{uuid4().hex[:12]}"
     print(f"POST {args.url}/v1/webhooks/{args.source}  (event id: {event_id})")
     for i in range(1, args.count + 1):
         print(f"delivery {i}/{args.count}:")

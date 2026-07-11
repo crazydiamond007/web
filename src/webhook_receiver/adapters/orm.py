@@ -165,9 +165,12 @@ class ProcessingAttempt(Base):
     attempt_number: Mapped[int] = mapped_column(Integer)
 
     started_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    # Nullable until the attempt lands. A row with `finished_at IS NULL` and a
-    # stale `started_at` is exactly the signature of a worker that died
-    # mid-processing (NFR-4).
+    # Nullable in the schema, but never actually null in practice: the attempt is
+    # written in the same transaction as the work it describes, so it only becomes
+    # visible once it is complete (ADR-0003). A half-written attempt is not a state
+    # this design can produce -- which costs us a diagnostic for a worker that died
+    # mid-processing, and buys us never having produced the half-applied effect
+    # that diagnostic would have been pointing at (NFR-4).
     finished_at: Mapped[datetime | None]
     outcome: Mapped[AttemptOutcome | None] = mapped_column(
         _pg_enum(AttemptOutcome, "attempt_outcome")
@@ -235,7 +238,15 @@ class Account(Base):
     id: Mapped[int] = _pk()
     external_ref: Mapped[str] = mapped_column(Text)
     balance_minor: Mapped[int] = mapped_column(BigInteger, server_default="0")
-    version: Mapped[int] = mapped_column(Integer, server_default="0")
+    # FR-10: the `provider_sequence` of the newest event applied to this account
+    # -- a high-water mark, not a row counter. A snapshot whose sequence does not
+    # exceed it arrived late and is superseded rather than applied.
+    #
+    # `BigInteger` because it stores a provider sequence, and
+    # `webhook_event.provider_sequence` is one. As `Integer` it would truncate
+    # above 2^31-1 and compare against a wrong number, discarding live snapshots
+    # as stale (migration 0002).
+    version: Mapped[int] = mapped_column(BigInteger, server_default="0")
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 

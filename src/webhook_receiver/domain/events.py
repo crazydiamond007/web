@@ -36,6 +36,33 @@ class IncomingEvent:
     provider_sequence: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class StoredEvent:
+    """A persisted event, as a handler sees it (FR-7, FR-8).
+
+    The worker reads a row and hands one of these to a handler. It is a strict
+    subset of the row: no `status`, no `next_attempt_at`, no `last_error`. A
+    handler decides *what this event means*, and queue bookkeeping is none of its
+    business -- a handler that could see the retry state would eventually branch
+    on it.
+
+    `provider_sequence` is the ordering key where the provider gives us one
+    (FR-10). It is `None` for providers that don't, which is why the guard lives
+    with the state-setting effect rather than being applied blindly to every
+    event.
+    """
+
+    id: int
+    source: str
+    event_type: str
+    entity_type: str
+    entity_id: str
+    payload: JsonObject
+    occurred_at: datetime
+    provider_sequence: int | None
+    attempt_count: int
+
+
 class MalformedPayloadError(Exception):
     """The body verified, but is not an event we can route.
 

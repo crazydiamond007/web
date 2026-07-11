@@ -13,6 +13,7 @@ dependencies = [
     "alembic>=1.14",
     "structlog>=24.4",
     "prometheus-client>=0.21",
+    "pytest>=9.1.1",
 ]
 
 [project.optional-dependencies]

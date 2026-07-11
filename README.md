@@ -49,9 +49,24 @@ That brings up four services in order: `postgres` → `migrate` (applies migrati
 `app` and `worker`.
 
 There's a `Makefile` wrapping both ways to run it — `make` on its own lists every target. The
-Docker stack is `make up` / `make down`; the local flow is below. Once it's running, POST a
-signed demo event with `make send` (`make send ARGS="--count 2"` to see idempotency: one row, two
-`200`s, the second a duplicate).
+Docker stack is `make up` / `make down`; the local flow is below.
+
+Once it's up, `make demo` sends a signed event twice and then delivers two snapshots out of order,
+and `make balance` shows what the worker did with them:
+
+```bash
+make demo      # duplicate delivery + reordered delivery, on one account
+make balance   # the account, the ledger, and every processing attempt
+```
+
+The balance lands on **1000**, the ledger has one row per *applied* event, and the stale snapshot is
+recorded as `superseded` rather than applied. To drive it by hand, `make send` takes flags:
+
+```bash
+make send ARGS="--count 2"                                       # same event twice -> one row
+make send ARGS="--event-type balance.snapshot --balance 900 --sequence 3"
+make send ARGS="--skew 400"                                      # stale signature -> 401
+```
 
 Check it's up:
 
@@ -91,6 +106,40 @@ make worker         # uv run python -m webhook_receiver.worker.main   (a second 
 ```
 
 Then, from a third terminal, `make send` posts a correctly signed event to the running app.
+
+### Connecting a SQL client (DataGrip, psql, pgAdmin)
+
+Postgres is published on your host while the stack is up, so any client can reach it. There's nothing
+extra to create — run **`make db-url`** and it prints exactly what to paste in:
+
+| Field | Value |
+|---|---|
+| Host | `localhost` |
+| Port | whatever `DATABASE_URL` in your `.env` says (`5432` by default) |
+| Database | `webhook_receiver` |
+| User | `webhook` |
+| Password | `webhook` |
+
+Local-dev credentials only — they're set in `docker-compose.yml` and guard nothing. `make psql` opens
+a shell on the same database.
+
+**If something already owns port 5432, change the port in `DATABASE_URL` and nothing else.** The
+Makefile derives the published port from it, so the container, the local app, and your SQL client
+move together.
+
+That clash is worth knowing about, because it does not announce itself. A natively installed Postgres
+(common on WSL and Homebrew) keeps 5432, Docker still reports the port as published, your connection
+still succeeds — and it lands on *the other server*, which answers:
+
+```
+asyncpg.exceptions.InvalidPasswordError: password authentication failed for user "webhook"
+```
+
+That is not a credentials bug. It means you are talking to the wrong database. Set the port in
+`DATABASE_URL` to `5433`, re-run `make db-up`, and it goes away.
+
+`make up` migrates the database for you. **`make db-up` does not** — run `make migrate` after it, or
+your client will connect to a database with no tables.
 
 ### Tests
 
@@ -175,10 +224,17 @@ docs/adr/      architecture decision records
 ```
 
 
-Endpoints live today: `GET /healthz`, `GET /readyz`.
+## What works today
 
-The database schema is already complete — all six tables and four enum types, with every constraint
-the design depends on.
+| | |
+|---|---|
+| **Endpoints** | `POST /v1/webhooks/{source}`, `GET /healthz`, `GET /readyz` |
+| **Event types** | `balance.credited`, `balance.debited`, `balance.snapshot` |
+| **Guarantees** | Signature + timestamp verification, deduplicated ingestion, exactly-once effects, per-entity serialisation, out-of-order handling |
+
+Not built yet: retry backoff, the dead-letter queue and replay endpoint, the admin query API, and
+`/metrics`. An event that fails is retried on a fixed delay and dead-lettered after `MAX_ATTEMPTS`;
+the jittered schedule and the DLQ lifecycle land next.
 
 ## Further reading
 

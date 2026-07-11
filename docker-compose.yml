@@ -6,17 +6,23 @@
 
 name: webhook-receiver
 
-# These are local-development values and no more: the compose stack is not
-# reachable off-host and the "secrets" below sign nothing real. Production
-# supplies all four from the environment (SPEC §NFR-6).
+# The secrets come from your `.env` (Compose reads it for interpolation), and
+# they have NO default here on purpose.
 #
-# WEBHOOK_SECRETS is written literally rather than as ${VAR:-{"..."}} because a
-# `}` inside a Compose default value terminates the interpolation early. Export
-# it in your shell (or a local .env) to override.
+# An inline default would be worse than no default. Whatever signs a request from
+# the host -- `make send`, a test, a provider simulator -- reads the secret from
+# `.env`, while the container would be verifying against the default baked in
+# here. The two would silently disagree and every delivery would come back 401,
+# with the correct-by-design indistinguishable error message telling you nothing
+# about why. `:?` turns that into an immediate, explicit failure at `up` instead.
+#
+# DATABASE_URL is *not* taken from `.env`: inside the Compose network the host is
+# `postgres`, whereas `.env` points at localhost for the local (non-Docker) flow.
+# These are two different correct answers, so they stay separate.
 x-app-env: &app-env
   DATABASE_URL: postgresql+asyncpg://webhook:webhook@postgres:5432/webhook_receiver
-  ADMIN_API_KEY: ${ADMIN_API_KEY:-local-dev-admin-key}
-  WEBHOOK_SECRETS: '{"stripe":"whsec_local_dev_secret"}'
+  ADMIN_API_KEY: ${ADMIN_API_KEY:?set it in .env -- run `make env` to create one}
+  WEBHOOK_SECRETS: ${WEBHOOK_SECRETS:?set it in .env -- run `make env` to create one}
   ENVIRONMENT: ${ENVIRONMENT:-local}
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
@@ -28,7 +34,16 @@ services:
       POSTGRES_PASSWORD: webhook
       POSTGRES_DB: webhook_receiver
     ports:
-      - "5432:5432"
+      # The *host* side is overridable because 5432 is often already taken -- a
+      # native Postgres from a package manager, WSL, or Homebrew. When it is, the
+      # clash does not announce itself: Docker still reports the port as
+      # published, connections still succeed, and they land on the *other*
+      # server, which answers "password authentication failed for user webhook".
+      # That reads like a credentials bug and is not one.
+      #
+      # The Makefile derives this from DATABASE_URL, so the port you connect to
+      # and the port the container listens on cannot drift apart.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:

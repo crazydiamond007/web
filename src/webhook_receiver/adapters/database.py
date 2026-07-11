@@ -31,6 +31,13 @@ def create_engine(settings: Settings) -> AsyncEngine:
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
         pool_pre_ping=True,
+        # NFR-6. By default SQLAlchemy renders the bound parameters of a failing
+        # statement into the exception message -- which, for a failed insert of a
+        # webhook, is the entire payload. That message ends up in a log line, in
+        # `last_error`, and in whatever aggregator we ship logs to. This is the
+        # single flag that stops it, and it is the reason an error string can be
+        # persisted at all.
+        hide_parameters=True,
         future=True,
     )
 
