@@ -10,6 +10,19 @@ background worker applies the business effect exactly once.
 
 The design, requirements, and data model live in [`SPEC.md`](SPEC.md).
 
+## The number
+
+> **20,910 duplicate deliveries under concurrency. 2,466 distinct events. 2,466 ledger entries.
+> Zero double-processing. Ingestion p99 of 26 ms at 350 deliveries/s.**
+
+88% of that traffic was a redelivery of something already stored — and a redelivery costs exactly as
+much as a first delivery (p99 26 ms vs 27 ms), because deduplication is a single `INSERT ... ON
+CONFLICT`, not a lookup followed by a decision. If the duplicate path were the slow one, a provider
+retrying *during* an incident would deepen the incident.
+
+Reproduce it with `make load`. Method, the full latency curve, and where the ceiling actually is
+(spoiler: the app process, not Postgres) are in [`docs/load-test.md`](docs/load-test.md).
+
 ## What it does
 
 | | |
@@ -311,11 +324,17 @@ network; locally the worker's port is ephemeral so that `make up-scale` (four wo
 | **Event types** | `balance.credited`, `balance.debited`, `balance.snapshot` |
 | **Guarantees** | Signature + timestamp verification, deduplicated ingestion, exactly-once effects, per-entity serialisation, out-of-order handling, bounded retries with jittered backoff, dead-lettering, idempotent replay |
 
-Not built yet: the load test and the deploy (Day 4 of `SPEC.md` §7). The headline number — ingestion
-p99 and sustained throughput under 10,000 duplicate deliveries — is not measured yet, so it is not
-claimed here.
+**Deployment:** [`infra/`](infra/) holds Terraform for Fargate + RDS. It is **validated but never
+applied** — there's no AWS account behind it, and `terraform plan` has never run. It's there because
+"how would you deploy this?" deserves an answer you can review line by line, and a README claiming a
+deployment that never happened would be the one untrue thing in this repo.
 
 ## Further reading
 
-- [`SPEC.md`](SPEC.md) — requirements, data model, architecture
-- [`docs/adr/`](docs/adr/) — architecture decision records
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — the design, and the five constraints that do the work
+- [`docs/load-test.md`](docs/load-test.md) — the number, the method, and where the ceiling actually is
+- [`docs/runbook.md`](docs/runbook.md) — what to do when it's 3am and you've been paged
+- [`docs/database-objects.md`](docs/database-objects.md) — the views, triggers, and guards, with SQL to try them
+- [`docs/adr/`](docs/adr/) — eight architecture decision records, including the things I *didn't* build
+- [`infra/README.md`](infra/README.md) — the deployment, what it costs, and what's missing
+- [`SPEC.md`](SPEC.md) — the original requirements

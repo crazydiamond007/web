@@ -96,9 +96,13 @@ disallow_any_generics = true
 show_error_codes = true
 
 [[tool.mypy.overrides]]
-# testcontainers publishes no py.typed marker. alembic and sqlalchemy both do,
-# so they are checked normally.
-module = ["testcontainers.*"]
+# Neither publishes a py.typed marker. alembic and sqlalchemy both do, so they
+# are checked normally.
+#
+# asyncpg is used *directly* only by scripts/verify_load.py, which reaches the
+# database without the ORM on purpose: the load test's verdict must not be routed
+# through the same layer it is meant to be verifying.
+module = ["testcontainers.*", "asyncpg.*"]
 ignore_missing_imports = true
 
 # --- Tests -------------------------------------------------------------------

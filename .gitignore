@@ -18,3 +18,10 @@ build/
 *.swp
 .claude
 
+artifacts/
+
+# Terraform: providers and state are not source
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/*.tfstate*
+infra/*.tfvars
