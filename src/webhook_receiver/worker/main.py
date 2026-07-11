@@ -19,6 +19,7 @@ import contextlib
 import signal
 
 import structlog
+from prometheus_client import start_http_server
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from webhook_receiver.adapters import queue
@@ -125,6 +126,18 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, shutdown: asyncio.
 async def _main() -> None:
     settings = get_settings()
     configure_logging(level=settings.log_level, environment=settings.environment)
+
+    # FR-19. The worker owns the `processed`, `retried` and `dead_lettered`
+    # counters -- they are incremented in *this* process, and Prometheus scrapes a
+    # process, not an application. Without a server here they would be invisible:
+    # the app's /metrics would report only ingestion, and the half of the pipeline
+    # where events actually fail would have no telemetry at all.
+    #
+    # A daemon thread with its own tiny HTTP server, which is what
+    # `prometheus_client` gives us. It does not touch the event loop and it dies
+    # with the process.
+    start_http_server(settings.worker_metrics_port)
+    log.info("worker.metrics_listening", port=settings.worker_metrics_port)
 
     shutdown = asyncio.Event()
     _install_signal_handlers(asyncio.get_running_loop(), shutdown)

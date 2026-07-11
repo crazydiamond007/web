@@ -224,17 +224,51 @@ docs/adr/      architecture decision records
 ```
 
 
+## API
+
+Ingestion authenticates by **HMAC signature**; the admin routes authenticate by **API key**
+(`X-Admin-Key`). They are deliberately different: a provider has no account here, and an operator has
+no signing secret.
+
+| | |
+|---|---|
+| `POST /v1/webhooks/{source}` | Ingest a delivery. Signature-authenticated. |
+| `GET /v1/admin/events` | Filter events by status, source, type, entity, time. |
+| `GET /v1/admin/events/{id}` | One event with its full attempt history. |
+| `GET /v1/admin/dlq` | The dead-letter queue. |
+| `POST /v1/admin/dlq/{id}/resolve` \| `/discard` | Triage an entry. Both are terminal. |
+| `POST /v1/admin/replay` | Re-process events, the DLQ, or a time range. |
+| `GET /metrics` | Prometheus. The **worker** serves its own on `:9100` — see below. |
+| `GET /healthz` \| `/readyz` | Liveness and readiness. |
+
+The admin routes never return `payload` or `headers`. It's a support tool, and a support tool that
+prints the raw body turns every screenshot pasted into a ticket into a leak.
+
+```bash
+curl -H "X-Admin-Key: $ADMIN_API_KEY" localhost:8000/v1/admin/dlq
+curl -H "X-Admin-Key: $ADMIN_API_KEY" -X POST localhost:8000/v1/admin/replay \
+     -H 'content-type: application/json' -d '{"dead_lettered": true, "reason": "handler fixed"}'
+```
+
+### Metrics live in two processes
+
+`make metrics` scrapes the app (ingested, rejected, ingest latency). `make worker-metrics` scrapes
+the worker (processed, retried, dead-lettered, processing latency).
+
+They are separate because Prometheus scrapes a *process*, not an application, and the counters that
+matter most are incremented in the worker. In a real deployment both are scraped on the container
+network; locally the worker's port is ephemeral so that `make up-scale` (four workers) still works.
+
 ## What works today
 
 | | |
 |---|---|
-| **Endpoints** | `POST /v1/webhooks/{source}`, `GET /healthz`, `GET /readyz` |
 | **Event types** | `balance.credited`, `balance.debited`, `balance.snapshot` |
-| **Guarantees** | Signature + timestamp verification, deduplicated ingestion, exactly-once effects, per-entity serialisation, out-of-order handling |
+| **Guarantees** | Signature + timestamp verification, deduplicated ingestion, exactly-once effects, per-entity serialisation, out-of-order handling, bounded retries with jittered backoff, dead-lettering, idempotent replay |
 
-Not built yet: retry backoff, the dead-letter queue and replay endpoint, the admin query API, and
-`/metrics`. An event that fails is retried on a fixed delay and dead-lettered after `MAX_ATTEMPTS`;
-the jittered schedule and the DLQ lifecycle land next.
+Not built yet: the load test and the deploy (Day 4 of `SPEC.md` §7). The headline number — ingestion
+p99 and sustained throughput under 10,000 duplicate deliveries — is not measured yet, so it is not
+claimed here.
 
 ## Further reading
 

@@ -103,6 +103,17 @@ class Settings(BaseSettings):
 
     # --- Worker poll (FR-7) --------------------------------------------------
 
+    worker_metrics_port: int = Field(
+        default=9100,
+        gt=0,
+        le=65535,
+        description=(
+            "FR-19: the worker serves its own /metrics here. The processed, "
+            "retried and dead-lettered counters live in the worker process, and a "
+            "counter nothing can scrape is not a metric."
+        ),
+    )
+
     poll_batch_size: int = Field(
         default=100,
         gt=0,

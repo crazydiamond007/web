@@ -86,6 +86,18 @@ services:
       target: runtime
     environment: *app-env
     command: ["python", "-m", "webhook_receiver.worker.main"]
+    ports:
+      # FR-19. The worker serves its own /metrics: the processed, retried and
+      # dead-lettered counters are incremented in *this* process, and Prometheus
+      # scrapes a process, not an application.
+      #
+      # No host port is pinned, deliberately. A fixed `9100:9100` would make
+      # `--scale worker=4` fail outright -- four containers cannot share one host
+      # port -- so Docker assigns an ephemeral one per replica, which is exactly
+      # what a scaled service needs. `make worker-metrics` resolves it; a real
+      # deployment scrapes port 9100 on the container network and never goes
+      # through the host at all.
+      - "9100"
     depends_on:
       postgres:
         condition: service_healthy

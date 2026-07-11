@@ -8,6 +8,7 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help install env db-up db-down psql db-url migrate dev worker send balance demo \
+        metrics worker-metrics dlq \
         up up-scale down logs test test-unit lint types check fmt
 
 # Compose reads .env automatically; the local targets rely on Settings doing the
@@ -76,6 +77,14 @@ worker: ## Run the worker locally (a second terminal; needs db-up + migrate)
 
 send: ## POST a signed demo event to the running app (make send [ARGS="--count 2"])
 	uv run python scripts/send_webhook.py $(ARGS)
+
+worker-metrics: ## Scrape the worker's /metrics (processed, retried, dead-lettered)
+	@port=$$($(COMPOSE) port worker 9100 | cut -d: -f2); \
+		curl -fsS "http://localhost:$$port/metrics" | grep -E '^webhook_' || \
+		echo "no worker metrics yet -- is the stack up? (make up)"
+
+metrics: ## Scrape the app's /metrics (ingested, rejected, ingest latency)
+	@curl -fsS localhost:8000/metrics | grep -E '^webhook_' || echo "app not up? (make up)"
 
 balance: ## Show the account balances, the ledger, and the attempt log
 	@$(COMPOSE) exec -T postgres psql -U webhook -d webhook_receiver -c \
