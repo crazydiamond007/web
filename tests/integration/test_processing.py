@@ -151,7 +151,7 @@ class TestExactlyOnce:
             factory, event_id=event_id, registry=registry, settings=settings, clock=clock, rng=RNG
         )
 
-        assert outcome is AttemptOutcome.SUCCEEDED
+        assert outcome.outcome is AttemptOutcome.SUCCEEDED
         assert await balance_of(engine) == 500
         assert await count_of(engine, LedgerEntry) == 1
 
@@ -190,7 +190,7 @@ class TestExactlyOnce:
         # Reported as a success, because it *is* one: the effect exists, which is
         # all the caller ever asked for. The unique constraint stopped the second
         # ledger row, so the balance did not move.
-        assert outcome is AttemptOutcome.SUCCEEDED
+        assert outcome.outcome is AttemptOutcome.SUCCEEDED
         assert await balance_of(engine) == 500
         assert await count_of(engine, LedgerEntry) == 1
 
@@ -331,7 +331,7 @@ class TestPerEntitySerialisation:
                 factory, event_id=other, registry=registry, settings=settings, clock=clock, rng=RNG
             )
 
-        assert outcome is AttemptOutcome.SUCCEEDED
+        assert outcome.outcome is AttemptOutcome.SUCCEEDED
         assert await balance_of(engine, "acct_2") == 700
 
     async def test_an_event_for_a_locked_account_is_retried_not_failed(
@@ -360,7 +360,7 @@ class TestPerEntitySerialisation:
                 rng=RNG,
             )
 
-        assert outcome is AttemptOutcome.RETRYABLE_ERROR
+        assert outcome.outcome is AttemptOutcome.RETRYABLE_ERROR
         assert await count_of(engine, LedgerEntry) == 0
 
         status, attempts = await event_row(engine, event_id)
@@ -408,17 +408,16 @@ class TestOrdering:
                 provider_sequence=1,
             )
 
-        assert (
-            await process_event(
-                factory, event_id=newer, registry=registry, settings=settings, clock=clock, rng=RNG
-            )
-            is AttemptOutcome.SUCCEEDED
+        first = await process_event(
+            factory, event_id=newer, registry=registry, settings=settings, clock=clock, rng=RNG
         )
+        assert first.outcome is AttemptOutcome.SUCCEEDED
+
         stale_outcome = await process_event(
             factory, event_id=older, registry=registry, settings=settings, clock=clock, rng=RNG
         )
 
-        assert stale_outcome is AttemptOutcome.SUPERSEDED
+        assert stale_outcome.outcome is AttemptOutcome.SUPERSEDED
         assert await balance_of(engine) == 1000  # the newer state survived
         assert await count_of(engine, LedgerEntry) == 1  # the stale event applied nothing
 
@@ -501,7 +500,7 @@ class TestFailure:
 
         # Straight to the DLQ on the first attempt: it will be just as unknown on
         # the fifth, and retrying it would only delay the events behind it.
-        assert outcome is AttemptOutcome.NON_RETRYABLE_ERROR
+        assert outcome.outcome is AttemptOutcome.NON_RETRYABLE_ERROR
 
         status, attempts = await event_row(engine, event_id)
         assert status is WebhookStatus.DEAD_LETTERED

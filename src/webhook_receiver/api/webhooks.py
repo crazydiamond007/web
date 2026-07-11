@@ -38,6 +38,7 @@ from webhook_receiver.api.schemas import (
 from webhook_receiver.api.signature import SIGNATURE_HEADER, SignatureError, verify_signature
 from webhook_receiver.api.state import AppStateDep, ClockDep
 from webhook_receiver.domain.events import MalformedPayloadError
+from webhook_receiver.obs import metrics
 from webhook_receiver.services.ingest import ingest_event
 
 router = APIRouter(prefix="/v1/webhooks", tags=["ingestion"])
@@ -71,57 +72,72 @@ async def ingest(
     settings = state.settings
     structlog.contextvars.bind_contextvars(source=source)
 
-    raw_body = await request.body()
-    # Bound the work before doing any of it: hashing a body is linear in its
-    # size, so an unbounded body is an unbounded CPU cost handed to an attacker.
-    if len(raw_body) > settings.max_payload_bytes:
-        log.warning("ingest.rejected", reason="payload_too_large", size=len(raw_body))
-        return Response(status_code=status.HTTP_413_CONTENT_TOO_LARGE)
+    # FR-19 / NFR-2. Timed around the whole handler, including the commit: the
+    # number that matters is what the *provider* waits for, not what we would like
+    # to take credit for.
+    with metrics.ingest_latency.labels(source=source).time():
+        raw_body = await request.body()
+        # Bound the work before doing any of it: hashing a body is linear in its
+        # size, so an unbounded body is an unbounded CPU cost handed to an attacker.
+        if len(raw_body) > settings.max_payload_bytes:
+            log.warning("ingest.rejected", reason="payload_too_large", size=len(raw_body))
+            metrics.events_rejected.labels(source=source, reason="payload_too_large").inc()
+            return Response(status_code=status.HTTP_413_CONTENT_TOO_LARGE)
 
-    # An unknown source and a bad signature must be indistinguishable from
-    # outside, so both return the byte-identical `_UNAUTHORIZED` below. Only the
-    # internal log line -- never seen by the caller -- tells them apart.
-    secret = settings.secret_for_source(source)
-    if secret is None:
-        log.warning("ingest.unauthorized", failure="UnknownSource")
-        return _UNAUTHORIZED
+        # An unknown source and a bad signature must be indistinguishable from
+        # outside, so both return the byte-identical `_UNAUTHORIZED` below. Only
+        # the internal log line -- never seen by the caller -- tells them apart.
+        secret = settings.secret_for_source(source)
+        if secret is None:
+            log.warning("ingest.unauthorized", failure="UnknownSource")
+            metrics.events_rejected.labels(source=source, reason="unauthorized").inc()
+            return _UNAUTHORIZED
 
-    try:
-        verify_signature(
-            secret=secret.get_secret_value(),
-            raw_body=raw_body,
-            raw_header=request.headers.get(SIGNATURE_HEADER),
-            now=clock.now(),
-            tolerance_seconds=settings.signature_timestamp_tolerance_seconds,
+        try:
+            verify_signature(
+                secret=secret.get_secret_value(),
+                raw_body=raw_body,
+                raw_header=request.headers.get(SIGNATURE_HEADER),
+                now=clock.now(),
+                tolerance_seconds=settings.signature_timestamp_tolerance_seconds,
+            )
+        except SignatureError as exc:
+            # The class name diagnoses it for us; it never reaches the client, and
+            # it never carries the body or the secret (NFR-6).
+            log.warning("ingest.unauthorized", failure=type(exc).__name__)
+            # The *metric* is as coarse as the response. A per-failure-mode counter
+            # would hand an attacker the oracle the 401 was carefully denying them,
+            # via a /metrics endpoint that is easier to scrape than to time.
+            metrics.events_rejected.labels(source=source, reason="unauthorized").inc()
+            return _UNAUTHORIZED
+
+        try:
+            envelope = parse_envelope(raw_body)
+            idempotency_key = resolve_idempotency_key(
+                envelope, request.headers.get(IDEMPOTENCY_KEY_HEADER)
+            )
+        except MalformedPayloadError as exc:
+            # Safe to surface: the request authenticated, so this is not an oracle,
+            # and the message names offending *fields*, never their values.
+            log.info("ingest.malformed", detail=str(exc))
+            metrics.events_rejected.labels(source=source, reason="malformed").inc()
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST, content={"detail": str(exc)}
+            )
+
+        event = to_incoming_event(
+            source=source,
+            envelope=envelope,
+            payload=envelope.data,
+            headers=redact_headers(dict(request.headers)),
+            idempotency_key=idempotency_key,
+            signature_verified=True,
         )
-    except SignatureError as exc:
-        # The class name diagnoses it for us; it never reaches the client, and it
-        # never carries the body or the secret (NFR-6).
-        log.warning("ingest.unauthorized", failure=type(exc).__name__)
-        return _UNAUTHORIZED
 
-    try:
-        envelope = parse_envelope(raw_body)
-        idempotency_key = resolve_idempotency_key(
-            envelope, request.headers.get(IDEMPOTENCY_KEY_HEADER)
-        )
-    except MalformedPayloadError as exc:
-        # Safe to surface: the request authenticated, so this is not an oracle,
-        # and the message names offending *fields*, never their values.
-        log.info("ingest.malformed", detail=str(exc))
-        return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"detail": str(exc)})
+        async with session_scope(state.session_factory) as session:
+            result = await ingest_event(session, event)
 
-    event = to_incoming_event(
-        source=source,
-        envelope=envelope,
-        payload=envelope.data,
-        headers=redact_headers(dict(request.headers)),
-        idempotency_key=idempotency_key,
-        signature_verified=True,
-    )
-
-    async with session_scope(state.session_factory) as session:
-        result = await ingest_event(session, event)
+    metrics.events_ingested.labels(source=source, duplicate=str(result.duplicate).lower()).inc()
 
     return JSONResponse(
         status_code=status.HTTP_200_OK,

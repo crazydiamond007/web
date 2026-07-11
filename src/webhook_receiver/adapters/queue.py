@@ -17,12 +17,17 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from webhook_receiver.adapters.orm import DeadLetterEntry, ProcessingAttempt, WebhookEvent
-from webhook_receiver.domain.enums import AttemptOutcome, WebhookStatus
+from webhook_receiver.adapters.orm import (
+    DeadLetterEntry,
+    ProcessingAttempt,
+    ReplayRequest,
+    WebhookEvent,
+)
+from webhook_receiver.domain.enums import AttemptOutcome, DlqStatus, ReplayOutcome, WebhookStatus
 from webhook_receiver.domain.events import StoredEvent
 
 DLQ_CONSTRAINT = "uq_dead_letter_entry_event_id"
@@ -103,6 +108,55 @@ async def load_for_update(session: AsyncSession, *, event_id: int) -> StoredEven
     return None if row is None else _to_domain(row)
 
 
+async def next_attempt_number(session: AsyncSession, *, event_id: int) -> int:
+    """The next unused `attempt_number` for this event.
+
+    Derived from the attempt *history*, not from `attempt_count`, because the two
+    stopped meaning the same thing the moment replay existed (FR-16):
+
+    * `attempt_number` is a fact about what happened -- it must never repeat, or
+      `uq_processing_attempt_event_id_attempt_number` rejects the row and the
+      audit trail loses an attempt.
+    * `attempt_count` is the retry *budget*, and a replay deliberately resets it
+      so a fixed event gets a fresh set of tries (FR-13).
+
+    Deriving one from the other, as this did before replay landed, meant that
+    replaying any event with a prior attempt would violate the unique constraint.
+    """
+    highest = (
+        await session.execute(
+            select(func.max(ProcessingAttempt.attempt_number)).where(
+                ProcessingAttempt.event_id == event_id
+            )
+        )
+    ).scalar_one_or_none()
+    return (highest or 0) + 1
+
+
+async def requeue(session: AsyncSession, *, event_id: int, now: datetime) -> None:
+    """Make an event due again, with a clean retry budget (FR-16).
+
+    Used only by replay. `attempt_count` goes back to zero on purpose: an operator
+    replaying an event has usually just fixed whatever broke it, and making it
+    fail once and dead-letter itself immediately -- because the old budget was
+    already spent -- would make replay useless for the case it exists to serve.
+
+    The attempt *history* is untouched. It is an audit log, and an audit log that
+    forgets is not one.
+    """
+    await session.execute(
+        update(WebhookEvent)
+        .where(WebhookEvent.id == event_id)
+        .values(
+            status=WebhookStatus.PENDING,
+            attempt_count=0,
+            next_attempt_at=now,
+            last_error=None,
+            processed_at=None,
+        )
+    )
+
+
 async def record_attempt(
     session: AsyncSession,
     *,
@@ -136,7 +190,7 @@ async def record_attempt(
 
 
 async def mark_succeeded(
-    session: AsyncSession, *, event_id: int, attempt_number: int, now: datetime
+    session: AsyncSession, *, event_id: int, attempts_used: int, now: datetime
 ) -> None:
     """Terminal, and it includes the superseded case.
 
@@ -150,7 +204,9 @@ async def mark_succeeded(
         .where(WebhookEvent.id == event_id)
         .values(
             status=WebhookStatus.SUCCEEDED,
-            attempt_count=attempt_number,
+            # The retry budget consumed in this cycle -- not the attempt number,
+            # which counts the whole history including previous replays.
+            attempt_count=attempts_used,
             processed_at=now,
             last_error=None,
         )
@@ -161,7 +217,7 @@ async def reschedule(
     session: AsyncSession,
     *,
     event_id: int,
-    attempt_number: int,
+    attempts_used: int,
     next_attempt_at: datetime,
     last_error: str,
 ) -> None:
@@ -176,11 +232,89 @@ async def reschedule(
         .where(WebhookEvent.id == event_id)
         .values(
             status=WebhookStatus.PENDING,
-            attempt_count=attempt_number,
+            attempt_count=attempts_used,
             next_attempt_at=next_attempt_at,
             last_error=last_error,
         )
     )
+
+
+async def latest_attempt_id(session: AsyncSession, *, event_id: int) -> int | None:
+    """The attempt a replay produced, for `replay_request.resulting_attempt_id`.
+
+    `None` when the replay never got as far as an attempt -- another worker had
+    already claimed the event. The audit row is written either way; a replay that
+    achieved nothing is exactly the kind an operator goes looking for later.
+    """
+    return (
+        await session.execute(
+            select(func.max(ProcessingAttempt.id)).where(ProcessingAttempt.event_id == event_id)
+        )
+    ).scalar_one_or_none()
+
+
+async def record_replay_request(
+    session: AsyncSession,
+    *,
+    event_id: int,
+    requested_by: str,
+    reason: str | None,
+    outcome: ReplayOutcome,
+    requested_at: datetime,
+    resulting_attempt_id: int | None,
+) -> None:
+    """Who ran the replay, when, why, and how it went (FR-16).
+
+    Written unconditionally, including for a replay that failed or did nothing. An
+    audit trail that only records the successes is a marketing document.
+    """
+    session.add(
+        ReplayRequest(
+            event_id=event_id,
+            requested_by=requested_by,
+            requested_at=requested_at,
+            reason=reason,
+            outcome=outcome,
+            resulting_attempt_id=resulting_attempt_id,
+        )
+    )
+    await session.flush()
+
+
+async def dead_lettered_event_ids(
+    session: AsyncSession, *, limit: int, dlq_status: DlqStatus = DlqStatus.NEEDS_REVIEW
+) -> Sequence[int]:
+    """Events sitting in the DLQ, for a "replay the DLQ" request (FR-16).
+
+    Oldest first here, unlike the operator-facing listing: a bulk replay should
+    drain the backlog in the order it accumulated, so a poison event from March
+    does not sit behind everything that broke since.
+    """
+    statement = (
+        select(DeadLetterEntry.event_id)
+        .where(DeadLetterEntry.status == dlq_status)
+        .order_by(DeadLetterEntry.dead_lettered_at)
+        .limit(limit)
+    )
+    return (await session.execute(statement)).scalars().all()
+
+
+async def event_ids_in_range(
+    session: AsyncSession, *, since: datetime, until: datetime, limit: int
+) -> Sequence[int]:
+    """Events received in a time window, for a "replay this window" request (FR-16).
+
+    On `received_at`, not `occurred_at`: an operator replaying a window is
+    reasoning about when *we* got it and therefore when our bug could have touched
+    it, not about when it happened at the provider.
+    """
+    statement = (
+        select(WebhookEvent.id)
+        .where(WebhookEvent.received_at >= since, WebhookEvent.received_at < until)
+        .order_by(WebhookEvent.received_at)
+        .limit(limit)
+    )
+    return (await session.execute(statement)).scalars().all()
 
 
 async def dead_letter(

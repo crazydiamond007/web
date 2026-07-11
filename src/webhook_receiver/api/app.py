@@ -14,7 +14,7 @@ import structlog
 from fastapi import FastAPI
 
 from webhook_receiver.adapters.database import create_engine, create_session_factory
-from webhook_receiver.api import health, webhooks
+from webhook_receiver.api import admin, health, metrics, webhooks
 from webhook_receiver.api.middleware import CorrelationIdMiddleware
 from webhook_receiver.api.state import STATE_ATTR, AppState
 from webhook_receiver.config import Settings, get_settings
@@ -58,4 +58,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(CorrelationIdMiddleware)
     app.include_router(health.router)
     app.include_router(webhooks.router)
+    app.include_router(admin.router)
+    app.include_router(metrics.router)
     return app

@@ -12,7 +12,7 @@ name: webhook-receiver
 # An inline default would be worse than no default. Whatever signs a request from
 # the host -- `make send`, a test, a provider simulator -- reads the secret from
 # `.env`, while the container would be verifying against the default baked in
-# here. The two would silently disagree and every delivery would come back 401,
+# here. The two would silently disagree, and every delivery would come back 401,
 # with the correct-by-design indistinguishable error message telling you nothing
 # about why. `:?` turns that into an immediate, explicit failure at `up` instead.
 #

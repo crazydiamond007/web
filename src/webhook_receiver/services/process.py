@@ -23,6 +23,7 @@ This is the reason `process_event` takes a session *factory* and not a session.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import structlog
@@ -42,6 +43,7 @@ from webhook_receiver.domain.enums import AttemptOutcome
 from webhook_receiver.domain.errors import ProcessingError
 from webhook_receiver.domain.events import StoredEvent
 from webhook_receiver.domain.handlers import HandlerRegistry
+from webhook_receiver.obs import metrics
 
 log = structlog.get_logger(__name__)
 
@@ -64,6 +66,33 @@ _SUCCESS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessResult:
+    """What one pass over one event did.
+
+    `outcome` is what the *attempt* was; `effect` is what happened to the
+    business state. They are separate because replay (FR-16) has to tell the
+    difference between "I applied the effect" and "the effect was already there
+    and I correctly did nothing" -- and both of those are a `SUCCEEDED` attempt.
+    Collapsing them would make a replay report success for work it did not do.
+    """
+
+    outcome: AttemptOutcome | None
+    effect: EffectResult | None
+
+    @property
+    def claimed(self) -> bool:
+        """Did we get the event at all?
+
+        `False` when another worker held the row (`SKIP LOCKED` stepped over it)
+        or it was not due. Normal with several workers on one queue, not an error.
+        """
+        return self.outcome is not None
+
+
+NOT_CLAIMED = ProcessResult(outcome=None, effect=None)
+
+
 async def process_event(
     factory: async_sessionmaker[AsyncSession],
     *,
@@ -72,19 +101,14 @@ async def process_event(
     settings: Settings,
     clock: Clock,
     rng: Rng,
-) -> AttemptOutcome | None:
-    """Run one event to a terminal state, or hand it back.
-
-    Returns the attempt's outcome, or `None` when the event was not ours to
-    process -- another worker holds it, or it is no longer due. That is a normal
-    result of two workers polling the same queue, not an error.
-    """
+) -> ProcessResult:
+    """Run one event to a terminal state, or hand it back."""
     started_at = clock.now()
     try:
         async with session_scope(factory) as session:
             event = await queue.claim(session, event_id=event_id, now=started_at)
             if event is None:
-                return None
+                return NOT_CLAIMED
             return await _apply(
                 session,
                 event=event,
@@ -98,15 +122,15 @@ async def process_event(
         # rest). It is here because *any* escaping exception kills the worker
         # loop, and a single poison event must not take the fleet down with it.
         #
-        # Anything not explicitly NonRetryable is treated as retryable, including
-        # a bug in our own code: an unknown failure *might* be transient, and
-        # `max_attempts` bounds the cost of being wrong about that. The event
-        # ends up dead-lettered with the exception's class name on it, which is a
-        # far better outcome than an infinite hot loop.
+        # It does not decide anything: `is_retryable` does, and its default is
+        # "no". An exception we cannot classify is far more likely to be our bug
+        # than a transient fault, so it is dead-lettered for a human rather than
+        # retried five times (SPEC §6.6, adapters/failures.py).
         return await _record_failure(
             factory,
             event_id=event_id,
             exc=exc,
+            registry=registry,
             settings=settings,
             clock=clock,
             rng=rng,
@@ -122,10 +146,14 @@ async def _apply(
     settings: Settings,
     clock: Clock,
     started_at: datetime,
-) -> AttemptOutcome:
+) -> ProcessResult:
     """The happy path, holding the row lock and the entity lock."""
     structlog.contextvars.bind_contextvars(event_id=event.id, event_type=event.event_type)
-    attempt_number = event.attempt_count + 1
+    # Two different numbers, and conflating them is what broke replay:
+    #   attempt_number -- a fact about history; must never repeat (unique constraint)
+    #   attempts_used  -- the retry budget for THIS cycle; replay resets it to 0
+    attempt_number = await queue.next_attempt_number(session, event_id=event.id)
+    attempts_used = event.attempt_count + 1
 
     # FR-9. Taken *after* the row is claimed and *before* anything is read, so no
     # two workers can be between the read and the write on one entity at once.
@@ -150,7 +178,13 @@ async def _apply(
         outcome=outcome,
     )
     await queue.mark_succeeded(
-        session, event_id=event.id, attempt_number=attempt_number, now=finished_at
+        session, event_id=event.id, attempts_used=attempts_used, now=finished_at
+    )
+
+    label = metrics.known_event_type(event.event_type, registry.event_types)
+    metrics.events_processed.labels(event_type=label, outcome=outcome.value).inc()
+    metrics.process_latency.labels(event_type=label).observe(
+        (finished_at - started_at).total_seconds()
     )
 
     log.info(
@@ -160,7 +194,7 @@ async def _apply(
         attempt=attempt_number,
         entity_id=event.entity_id,
     )
-    return outcome
+    return ProcessResult(outcome=outcome, effect=result)
 
 
 async def _record_failure(
@@ -168,11 +202,12 @@ async def _record_failure(
     *,
     event_id: int,
     exc: Exception,
+    registry: HandlerRegistry,
     settings: Settings,
     clock: Clock,
     rng: Rng,
     started_at: datetime,
-) -> AttemptOutcome | None:
+) -> ProcessResult:
     """Write the failed attempt and decide the event's fate, in a fresh transaction.
 
     Fresh because the transaction that failed is, if the failure came from the
@@ -193,10 +228,12 @@ async def _record_failure(
         if event is None:
             # The row is gone. Nothing to record it against, and nothing to retry.
             log.error("process.event_vanished", event_id=event_id, error_class=type(exc).__name__)
-            return None
+            return NOT_CLAIMED
 
-        attempt_number = event.attempt_count + 1
+        attempt_number = await queue.next_attempt_number(session, event_id=event_id)
+        attempts_used = event.attempt_count + 1
         finished_at = clock.now()
+        label = metrics.known_event_type(event.event_type, registry.event_types)
         await queue.record_attempt(
             session,
             event_id=event_id,
@@ -208,7 +245,7 @@ async def _record_failure(
             error_detail=detail,
         )
 
-        exhausted = attempt_number >= settings.max_attempts
+        exhausted = attempts_used >= settings.max_attempts
         if retryable and not exhausted:
             # FR-12: exponential, capped, with FULL jitter -- so that a batch of
             # events that failed together does not retry together and knock the
@@ -223,35 +260,42 @@ async def _record_failure(
             await queue.reschedule(
                 session,
                 event_id=event_id,
-                attempt_number=attempt_number,
+                attempts_used=attempts_used,
                 next_attempt_at=next_attempt_at,
                 last_error=detail,
             )
+            metrics.events_retried.labels(event_type=label, error_class=type(exc).__name__).inc()
             log.warning(
                 "process.retry_scheduled",
                 event_id=event_id,
-                attempt=attempt_number,
+                attempt=attempts_used,
                 of_max=settings.max_attempts,
                 delay_seconds=round(delay, 3),
                 error_class=type(exc).__name__,
             )
-            return outcome
+            return ProcessResult(outcome=outcome, effect=None)
 
         reason = "attempts exhausted" if retryable else "non-retryable failure"
+        # The *metric* label is the coarse reason (two values, bounded). The DLQ
+        # row gets the exception class as well, because grouping the queue by
+        # failure type is the first thing an operator does with it, and a reason
+        # of "non-retryable failure" alone tells them nothing about which one.
+        dlq_reason = f"{reason} ({type(exc).__name__}): {detail}"
+        metrics.events_dead_lettered.labels(event_type=label, reason=reason).inc()
         await queue.dead_letter(
             session,
             event_id=event_id,
-            attempts_made=attempt_number,
-            reason=f"{reason}: {detail}",
+            attempts_made=attempts_used,
+            reason=dlq_reason,
         )
         log.error(
             "process.dead_lettered",
             event_id=event_id,
-            attempts=attempt_number,
+            attempts=attempts_used,
             reason=reason,
             error_class=type(exc).__name__,
         )
-        return outcome
+        return ProcessResult(outcome=outcome, effect=None)
 
 
 def _redacted_detail(exc: Exception) -> str:
