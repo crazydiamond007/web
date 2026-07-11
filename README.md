@@ -109,25 +109,37 @@ Then, from a third terminal, `make send` posts a correctly signed event to the r
 
 ### Connecting a SQL client (DataGrip, psql, pgAdmin)
 
-Postgres is published on the host's port `5432`, so any client can reach it while the stack is up.
-There's nothing extra to create — `make db-url` prints these:
+Postgres is published on your host while the stack is up, so any client can reach it. There's nothing
+extra to create — run **`make db-url`** and it prints exactly what to paste in:
 
 | Field | Value |
 |---|---|
 | Host | `localhost` |
-| Port | `5432` |
+| Port | whatever `DATABASE_URL` in your `.env` says (`5432` by default) |
 | Database | `webhook_receiver` |
 | User | `webhook` |
 | Password | `webhook` |
 
-JDBC: `jdbc:postgresql://localhost:5432/webhook_receiver`. Local-dev credentials only — they're set
-in `docker-compose.yml` and guard nothing.
+Local-dev credentials only — they're set in `docker-compose.yml` and guard nothing. `make psql` opens
+a shell on the same database.
+
+**If something already owns port 5432, change the port in `DATABASE_URL` and nothing else.** The
+Makefile derives the published port from it, so the container, the local app, and your SQL client
+move together.
+
+That clash is worth knowing about, because it does not announce itself. A natively installed Postgres
+(common on WSL and Homebrew) keeps 5432, Docker still reports the port as published, your connection
+still succeeds — and it lands on *the other server*, which answers:
+
+```
+asyncpg.exceptions.InvalidPasswordError: password authentication failed for user "webhook"
+```
+
+That is not a credentials bug. It means you are talking to the wrong database. Set the port in
+`DATABASE_URL` to `5433`, re-run `make db-up`, and it goes away.
 
 `make up` migrates the database for you. **`make db-up` does not** — run `make migrate` after it, or
-your client will connect to a database with no tables. `make psql` opens a shell on it directly.
-
-If port 5432 is already taken by a Postgres you run natively, change the *host* side of the mapping
-in `docker-compose.yml` (`"5433:5432"`) and point the client at 5433.
+your client will connect to a database with no tables.
 
 ### Tests
 

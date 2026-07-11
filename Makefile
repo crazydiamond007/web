@@ -12,7 +12,21 @@
 
 # Compose reads .env automatically; the local targets rely on Settings doing the
 # same (config.py: env_file=".env").
-COMPOSE := docker compose
+#
+# The host port Postgres is published on is derived from DATABASE_URL rather than
+# configured separately, because two knobs for one number will eventually
+# disagree -- and this particular disagreement is vicious. If something else
+# already owns 5432 (a native Postgres is common on WSL and Homebrew), Compose
+# still claims the port is published, the connection still succeeds, and it lands
+# on the *other* server. What comes back is "password authentication failed",
+# which sends you hunting for a credentials bug that does not exist.
+#
+# Deriving it means changing the port in DATABASE_URL moves the container, the
+# local app, and your SQL client together. It cannot be set in .env directly:
+# Settings has extra="forbid", so an infra-only key there would stop the app
+# booting.
+POSTGRES_HOST_PORT := $(shell sed -n 's|^DATABASE_URL=.*@[^:]*:\([0-9][0-9]*\)/.*|\1|p' .env 2>/dev/null | head -1)
+COMPOSE := POSTGRES_HOST_PORT=$(or $(POSTGRES_HOST_PORT),5432) docker compose
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -38,14 +52,18 @@ db-down: ## Stop Postgres and delete its data volume
 psql: ## Open a psql shell on the running database
 	$(COMPOSE) exec postgres psql -U webhook -d webhook_receiver
 
+PGPORT := $(or $(POSTGRES_HOST_PORT),5432)
+
 db-url: ## Print the connection settings (for DataGrip, psql, anything)
 	@echo "host      localhost"
-	@echo "port      5432"
+	@echo "port      $(PGPORT)"
 	@echo "database  webhook_receiver"
 	@echo "user      webhook"
 	@echo "password  webhook"
-	@echo "jdbc      jdbc:postgresql://localhost:5432/webhook_receiver"
-	@echo "psql      postgresql://webhook:webhook@localhost:5432/webhook_receiver"
+	@echo "jdbc      jdbc:postgresql://localhost:$(PGPORT)/webhook_receiver"
+	@echo "psql      postgresql://webhook:webhook@localhost:$(PGPORT)/webhook_receiver"
+	@echo ""
+	@echo "(port taken from DATABASE_URL in .env)"
 
 migrate: ## Apply migrations to the database in DATABASE_URL
 	uv run alembic upgrade head
