@@ -31,6 +31,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY src/ ./src/
 COPY migrations/ ./migrations/
 COPY alembic.ini ./
+# `license-files` in pyproject makes this a build input: hatchling refuses to
+# build the project without it. Copied here rather than into the layer above, so
+# it cannot invalidate the cached dependency install.
+COPY LICENSE ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 

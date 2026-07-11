@@ -2,8 +2,11 @@
 name = "webhook-receiver"
 version = "0.1.0"
 description = "Idempotent webhook receiver: at-least-once delivery, exactly-once effects."
-readme = "README.md"
 requires-python = "==3.12.*"
+# No `readme` field on purpose. It would make README.md a *build input*, so the
+# image build would need it copied in -- and a README that changes on every doc
+# edit has no business sitting next to the source in a container layer. LICENSE is
+# different: it is a build input by law rather than by taste, and it never changes.
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Narcisse Kabongo Ngandu", email = "narcissekabongongandu@gmail.com" }]
