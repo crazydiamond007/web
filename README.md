@@ -141,6 +141,12 @@ That is not a credentials bug. It means you are talking to the wrong database. S
 `make up` migrates the database for you. **`make db-up` does not** — run `make migrate` after it, or
 your client will connect to a database with no tables.
 
+**Keeping the database up without the app.** `postgres` is `restart: unless-stopped`, so once started
+it comes back on its own whenever Docker does — after a reboot, or a Docker Desktop restart. Start it
+once with `make db-up` and your SQL client can reach it from then on without the app or worker
+running at all. (On Windows this needs *Start Docker Desktop when you log in* enabled in Docker
+Desktop's settings; `make down` still stops it deliberately, and it stays stopped.)
+
 ### Tests
 
 ```bash
@@ -185,6 +191,9 @@ when someone has a `psql` prompt open:
 - A `resolved` or `discarded` DLQ entry is **terminal** and cannot reopen.
 
 **Functions**: `fn_account_balance(ref)`, `fn_ledger_invariant_ok()`, `fn_queue_lag()`.
+
+Every object, with copy-pasteable SQL to exercise it, is in
+[`docs/database-objects.md`](docs/database-objects.md).
 
 **Procedure**: `CALL sp_purge_history('90 days')` (or `make purge KEEP='30 days'`) — retention. It
 never deletes an event that produced an effect, because `ledger_entry.event_id` is `ON DELETE

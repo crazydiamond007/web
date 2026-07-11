@@ -29,6 +29,14 @@ x-app-env: &app-env
 services:
   postgres:
     image: postgres:16-alpine
+    # `app` and `worker` are `unless-stopped`; without the same policy here they
+    # would come back after a reboot and crash-loop against a database that did
+    # not. It also means the database survives a Docker Desktop restart on its
+    # own, so a SQL client can reach it without the app running at all.
+    #
+    # `unless-stopped`, not `always`: `make down` is a decision, and a container
+    # that resurrects itself after you deliberately stopped it is a poltergeist.
+    restart: unless-stopped
     environment:
       POSTGRES_USER: webhook
       POSTGRES_PASSWORD: webhook
