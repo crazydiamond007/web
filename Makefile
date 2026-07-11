@@ -8,7 +8,7 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help install env db-up db-down psql db-url migrate dev worker send balance demo \
-        metrics worker-metrics dlq \
+        metrics worker-metrics report purge \
         up up-scale down logs test test-unit lint types check fmt
 
 # Compose reads .env automatically; the local targets rely on Settings doing the
@@ -85,6 +85,17 @@ worker-metrics: ## Scrape the worker's /metrics (processed, retried, dead-letter
 
 metrics: ## Scrape the app's /metrics (ingested, rejected, ingest latency)
 	@curl -fsS localhost:8000/metrics | grep -E '^webhook_' || echo "app not up? (make up)"
+
+report: ## Operator's view: queue health, ledger reconciliation, open DLQ
+	@$(COMPOSE) exec -T postgres psql -U webhook -d webhook_receiver \
+		-c "SELECT * FROM v_queue_health;" \
+		-c "SELECT fn_ledger_invariant_ok() AS ledger_invariant_holds, fn_queue_lag() AS lag;" \
+		-c "SELECT external_ref, balance_minor, ledger_sum, drift FROM v_account_reconciliation;" \
+		-c "SELECT event_id, event_type, attempts_made, status, reason FROM v_dlq_open;"
+
+purge: ## Apply the retention policy (make purge KEEP='30 days')
+	@$(COMPOSE) exec -T postgres psql -U webhook -d webhook_receiver \
+		-c "CALL sp_purge_history(interval '$(or $(KEEP),90 days)');"
 
 balance: ## Show the account balances, the ledger, and the attempt log
 	@$(COMPOSE) exec -T postgres psql -U webhook -d webhook_receiver -c \

@@ -159,6 +159,42 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy                       # runs in --strict mode
 ```
 
+### Database objects
+
+Migration `0003` adds views, functions, triggers and a retention procedure. `make report` shows the
+useful ones:
+
+**Views** — the operator's read model. None of them exposes `payload` or `headers`.
+
+| | |
+|---|---|
+| `v_queue_health` | Are we falling behind? Keeps `due_now` separate from `waiting_on_backoff` — those are different incidents. |
+| `v_account_reconciliation` | `balance_minor` vs `SUM(ledger_entry)`. **`drift` must always be 0.** This is NFR-1 as a query. |
+| `v_dlq_open` | Everything still needing a human, oldest first. |
+| `v_event_overview` | One row per event with its last outcome and whether it produced an effect. |
+| `v_processing_outcomes` | Where the time goes, and what fails. |
+
+**Triggers** — invariants the application cannot defend, because the application isn't in the room
+when someone has a `psql` prompt open:
+
+- `ledger_entry` is **append-only**. UPDATE is refused outright (a correction is a compensating
+  entry, not a rewrite); DELETE is refused unless you deliberately `SET LOCAL app.allow_ledger_delete
+  = 'on'`. It fires *through* the `ON DELETE CASCADE` from `webhook_event`, which is the case that
+  would otherwise silently destroy a balance.
+- `processing_attempt` cannot be rewritten. An audit log that can be edited is a rumour.
+- A `resolved` or `discarded` DLQ entry is **terminal** and cannot reopen.
+
+**Functions**: `fn_account_balance(ref)`, `fn_ledger_invariant_ok()`, `fn_queue_lag()`.
+
+**Procedure**: `CALL sp_purge_history('90 days')` (or `make purge KEEP='30 days'`) — retention. It
+never deletes an event that produced an effect, because `ledger_entry.event_id` is `ON DELETE
+CASCADE` and a naive sweep would take the ledger with it.
+
+Deliberately **not** here: a trigger maintaining `account.balance` (the effect would then live half
+in Python and half in a trigger, and double-apply), and a SQL version of the advisory-lock key (it
+would use a different hash from the Python one, take a different lock, and corrupt a balance in
+silence — see ADR-0002).
+
 ### Migrations
 
 The schema is managed entirely by Alembic. The application never creates tables itself.

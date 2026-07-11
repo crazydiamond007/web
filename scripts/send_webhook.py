@@ -111,6 +111,13 @@ def _send(args: argparse.Namespace, secret: str, event_id: str) -> int:
         # not a script failure, so report it rather than raising.
         print(f"  {exc.code} {exc.read().decode()}")
         return int(exc.code)
+    except urllib.error.URLError as exc:
+        # Nothing is listening. A forty-line traceback for "the app isn't running"
+        # tells you less than one line does, and this is a script whose whole job
+        # is to be run by a human at a terminal.
+        print(f"  cannot reach {args.url}: {exc.reason}", file=sys.stderr)
+        print("  is the stack up? try `make up`", file=sys.stderr)
+        return 1
 
 
 def main() -> int:
