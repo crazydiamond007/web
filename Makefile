@@ -44,8 +44,13 @@ env: ## Create .env from .env.example if it does not exist
 
 # === Local: app in your venv, Postgres in a container ========================
 
-db-up: ## Start only Postgres (for the local app to talk to)
-	$(COMPOSE) up -d postgres
+db-up: ## Start only Postgres, and wait until it actually accepts connections
+	# `--wait` blocks on the healthcheck instead of returning the moment the
+	# container starts. Without it, `make db-up && make migrate` races a Postgres
+	# that is still doing initdb, and the migration dies with "connection reset by
+	# peer" mid-handshake -- which reads like a network fault and is really just
+	# an impatient client.
+	$(COMPOSE) up -d --wait postgres
 
 db-down: ## Stop Postgres and delete its data volume
 	$(COMPOSE) down -v
