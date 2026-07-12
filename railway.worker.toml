@@ -1,0 +1,50 @@
+# Railway service: `worker` (the queue processor).
+#
+# Same image, same repo, different process. Point the worker service's
+# "Config-as-code" path at this file (Settings -> Config-as-code ->
+# `railway.worker.toml`); otherwise it silently inherits `railway.toml` and comes
+# up as a second copy of the API, at which point nothing drains the queue and the
+# only symptom is that events sit in `pending` forever.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python -m webhook_receiver.worker.main"
+
+# ---------------------------------------------------------------------------
+# The single most important line in this file.
+#
+# A sleeping Railway service is woken by *inbound HTTP*. The worker receives no
+# inbound HTTP -- it polls Postgres. So with sleep enabled it goes to sleep, and
+# nothing ever wakes it: no request arrives, because requests go to the app.
+#
+# The failure is silent and total. The API keeps returning 202, every delivery is
+# durably written, `/healthz` is green, and not one event is ever processed. You
+# would find out from `v_queue_health` -- or from a customer.
+# ---------------------------------------------------------------------------
+sleepApplication = false
+
+# No `healthcheckPath`, deliberately. The worker serves HTTP only on the metrics
+# port (9100), never on the port Railway probes. Give it a health check and it
+# fails every probe, gets killed, restarts, fails again -- forever. This is the
+# same bug the Compose file already carries a scar from: the worker inherited the
+# image's HEALTHCHECK, which polls the *app's* port, and sat permanently unhealthy.
+
+# No `preDeployCommand`. The app owns the migration; running it here as well would
+# have two services racing `alembic upgrade head` against one database.
+
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+# The loop checks its shutdown Event *between* events, so a SIGTERM lands cleanly
+# on a transaction boundary and never mid-effect. This is the budget for the one
+# event that may be in flight when the signal arrives.
+drainingSeconds = 30
+
+# Safe to raise. FOR UPDATE SKIP LOCKED keeps two workers off the same row, and
+# the advisory lock keeps them off the same *entity* -- there is no leader, no
+# partition assignment, and no shared state beyond the database. On Hobby, though,
+# each replica is billed, and one worker drains this queue comfortably.
+numReplicas = 1

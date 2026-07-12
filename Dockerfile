@@ -63,8 +63,25 @@ EXPOSE 8000
 # Liveness only. Readiness is the orchestrator's business, and a container that
 # marks itself unhealthy on a database blip would be restarted rather than
 # drained -- exactly the failure /healthz vs /readyz exists to prevent.
+#
+# The probe reads $PORT for the same reason the CMD does. Pinned to 8000, it would
+# fail forever anywhere the platform assigns the port -- and a liveness probe that
+# cannot pass is not a warning, it is a restart loop.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"]
+    CMD ["python", "-c", "import os,sys,urllib.request; p=os.environ.get('PORT','8000'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/healthz', timeout=2).status == 200 else 1)"]
 
-CMD ["uvicorn", "webhook_receiver.api.app:create_app", \
-     "--factory", "--host", "0.0.0.0", "--port", "8000"]
+# `sh -c`, because the port must be expanded at *run* time. A PaaS (Railway,
+# Heroku, Cloud Run) picks the port and injects $PORT; Compose and a bare
+# `docker run` leave it unset and want 8000. Hardcoding 8000 binds a port the
+# platform's proxy is not routing to, and the deploy then fails its health check
+# while the application behind it runs perfectly well -- one of the more
+# infuriating ways to lose an afternoon.
+#
+# `exec` is not decoration. Without it, sh remains PID 1 and does not forward
+# SIGTERM, so a rolling deploy would leave uvicorn to be SIGKILLed once the grace
+# period expired, dropping in-flight requests. For an ingestion endpoint that
+# means a delivery the provider was told we accepted (202) and which never
+# reached the queue -- precisely the event-loss this service exists to prevent.
+# With `exec`, uvicorn *is* PID 1 and shuts down gracefully.
+CMD ["sh", "-c", \
+     "exec uvicorn webhook_receiver.api.app:create_app --factory --host 0.0.0.0 --port ${PORT:-8000}"]

@@ -13,12 +13,19 @@ from enum import StrEnum
 from functools import lru_cache
 from typing import Final
 
-from pydantic import Field, PostgresDsn, SecretStr, model_validator
+from pydantic import Field, PostgresDsn, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The provider signs `timestamp.payload`; ±5 minutes is the window Stripe uses
 # and is the smallest value that tolerates realistic clock skew between hosts.
 DEFAULT_TIMESTAMP_TOLERANCE_SECONDS: Final[int] = 300
+
+# This process talks to Postgres over asyncio, and only over asyncio.
+ASYNC_DRIVER: Final[str] = "postgresql+asyncpg"
+
+# What a managed provider hands you. Railway, Heroku, Render and RDS all publish
+# a DSN with no driver in it, because the driver is the client's business.
+DRIVERLESS_SCHEMES: Final[frozenset[str]] = frozenset({"postgres", "postgresql"})
 
 
 class Environment(StrEnum):
@@ -62,6 +69,41 @@ class Settings(BaseSettings):
     )
     db_pool_size: int = Field(default=10, ge=1)
     db_max_overflow: int = Field(default=5, ge=0)
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def _normalise_driver(cls, value: object) -> object:
+        """Accept a managed provider's driverless DSN; refuse a foreign driver.
+
+        A managed Postgres publishes ``postgresql://user:pw@host:5432/db``. Handed
+        that verbatim, ``create_async_engine`` resolves the dialect's *default*
+        driver -- psycopg2, which is synchronous and is not installed. The failure
+        surfaces at the first connection rather than at import, so the deploy goes
+        green, the health check passes, and the service falls over on the first
+        webhook. Rewriting the scheme here means the provider's own variable can be
+        pasted in as-is, with no hand-assembly of the URL from five parts and no
+        chance of fumbling the percent-encoding of a generated password.
+
+        A *different* explicit driver is an error, not something to overwrite. If
+        someone asks for ``+psycopg2`` they have made a decision this process
+        cannot honour, and silently substituting our own would be the worse answer.
+        """
+        if not isinstance(value, str):
+            return value
+
+        scheme, separator, remainder = value.partition("://")
+        if not separator:
+            return value  # Not a URL at all -- let PostgresDsn write the error.
+        if scheme in DRIVERLESS_SCHEMES:
+            return f"{ASYNC_DRIVER}://{remainder}"
+        if scheme != ASYNC_DRIVER:
+            msg = (
+                f"database_url uses the {scheme!r} driver, but this process is "
+                f"async-only and requires {ASYNC_DRIVER!r}. Pass a driverless "
+                f"'postgresql://' DSN and it will be adapted for you."
+            )
+            raise ValueError(msg)
+        return value
 
     # --- Ingestion / signature verification (FR-3, FR-4) ---------------------
 

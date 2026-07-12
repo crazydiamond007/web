@@ -11,6 +11,8 @@ two ways that rule can be got wrong:
 
 from __future__ import annotations
 
+import socket
+
 import pytest
 from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
@@ -128,3 +130,23 @@ class TestUnclassifiedIsNotRetried:
         exc = OperationalError("SELECT 1", {}, Exception("something odd"))
 
         assert is_retryable(exc) is False
+
+
+class TestSocketLevelFailures:
+    """asyncpg can fail *before* SQLAlchemy has anything to wrap."""
+
+    def test_a_dns_failure_is_retryable(self) -> None:
+        # What asyncpg actually raises -- raw and unwrapped -- when the database's
+        # hostname does not resolve: a managed Postgres cycling its container, or a
+        # private-network blip. gaierror is an OSError but NOT a ConnectionError,
+        # so it slips past the obvious check; unclassified, a brief DNS wobble
+        # would dead-letter every event in flight.
+        assert is_retryable(socket.gaierror(-2, "Name or service not known")) is True
+
+    def test_a_refused_connection_is_retryable(self) -> None:
+        assert is_retryable(ConnectionRefusedError("connection refused")) is True
+
+    def test_an_unrelated_oserror_is_not_retryable(self) -> None:
+        # The net stays narrow on purpose. Widening it to OSError would sweep in
+        # PermissionError and FileNotFoundError -- our bugs, not the world's.
+        assert is_retryable(PermissionError("denied")) is False

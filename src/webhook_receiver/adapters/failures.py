@@ -26,6 +26,8 @@ rather than a one-line `isinstance` check at the call site.
 
 from __future__ import annotations
 
+import socket
+
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
@@ -79,9 +81,21 @@ def is_retryable(exc: BaseException) -> bool:
         return sqlstate in RETRYABLE_SQLSTATES
 
     # A socket-level failure that never reached SQLAlchemy's wrapping is transient.
+    #
+    # `socket.gaierror` is named explicitly because it is the one that gets missed:
+    # it is an `OSError` but *not* a `ConnectionError`, so it slips past the obvious
+    # `ConnectionError` check and falls through to the default. It is what asyncpg
+    # raises -- raw and unwrapped, never reaching SQLAlchemy's DBAPIError layer --
+    # when the database's hostname stops resolving. That is not an exotic case: a
+    # managed Postgres cycling a container, or a private-network DNS blip on a PaaS,
+    # produces exactly this, and the connection fails before there is a connection
+    # to have an error *about*. Left unclassified, a fifteen-second DNS wobble would
+    # dead-letter every event in flight -- the very outcome the SQLSTATEs above are
+    # enumerated to prevent.
+    #
     # Everything else falls through as unclassified -- and SPEC §6.6 says an
     # unclassified failure is non-retryable. We do not know what it is, so we do
     # not retry it: an unrecognised exception is far more likely to be our bug
     # than the world's weather, and a human should see it now rather than in five
     # attempts' time.
-    return isinstance(exc, ConnectionError | TimeoutError)
+    return isinstance(exc, ConnectionError | TimeoutError | socket.gaierror)

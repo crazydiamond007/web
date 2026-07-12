@@ -25,14 +25,27 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from webhook_receiver.adapters import queue
 from webhook_receiver.adapters.clock import Clock, SystemClock
 from webhook_receiver.adapters.database import create_engine, create_session_factory, session_scope
+from webhook_receiver.adapters.failures import is_retryable
 from webhook_receiver.adapters.rng import Rng, create_rng
 from webhook_receiver.config import Settings, get_settings
+from webhook_receiver.domain.backoff import next_delay_seconds
 from webhook_receiver.domain.balance import registry
 from webhook_receiver.domain.handlers import HandlerRegistry
 from webhook_receiver.obs.logging import configure_logging
 from webhook_receiver.services.process import process_event
 
 log = structlog.get_logger(__name__)
+
+
+async def _wait(shutdown: asyncio.Event, seconds: float) -> None:
+    """Sleep for `seconds`, or wake immediately if a shutdown is requested.
+
+    Waiting on the event rather than sleeping makes shutdown prompt instead of
+    taking up to a full delay -- which matters most when the delay is a long
+    backoff and the platform is counting down to a SIGKILL.
+    """
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(shutdown.wait(), timeout=seconds)
 
 
 async def poll_once(
@@ -82,6 +95,12 @@ async def run(settings: Settings, shutdown: asyncio.Event) -> None:
 
     A full batch means the queue is backed up, so we come straight back for more
     instead of sleeping. Only an empty poll waits.
+
+    The database is this process's *input*, and it will go away sometimes -- a
+    failover, a restart, a private-network hiccup on a PaaS. A worker that exits
+    when that happens stops draining the queue while the API cheerfully carries on
+    accepting events, so a transient database failure is waited out here rather
+    than allowed to kill the process.
     """
     engine = create_engine(settings)
     factory = create_session_factory(engine)
@@ -104,15 +123,49 @@ async def run(settings: Settings, shutdown: asyncio.Event) -> None:
             # that looks like nothing until the retries synchronise.
             log.warning("worker.jitter_seeded", seed=settings.jitter_seed)
 
+        consecutive_failures = 0
+
         while not shutdown.is_set():
-            processed = await poll_once(
-                factory, settings=settings, clock=clock, rng=rng, handlers=registry
-            )
+            try:
+                processed = await poll_once(
+                    factory, settings=settings, clock=clock, rng=rng, handlers=registry
+                )
+            except Exception as exc:
+                # Only failures the taxonomy *recognises* are waited out. An
+                # unclassified exception is far more likely to be a bug in our own
+                # code than the world's weather, and looping on a bug forever would
+                # bury the stack trace instead of surfacing it. That one still kills
+                # the process, loudly -- which is what a restart policy is for.
+                if not is_retryable(exc):
+                    raise
+
+                consecutive_failures += 1
+                # The same full-jitter schedule the events themselves retry on
+                # (FR-12), for the same reason it exists there. When a database
+                # comes back, every worker in the fleet is sitting in this branch,
+                # and a fixed delay would have all of them reconnect on the same
+                # tick -- re-flooring a server that has just got to its feet.
+                delay = next_delay_seconds(
+                    attempt=consecutive_failures,
+                    base_seconds=settings.backoff_base_seconds,
+                    cap_seconds=settings.backoff_cap_seconds,
+                    rng=rng,
+                )
+                log.warning(
+                    "worker.poll_failed",
+                    error_class=type(exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                    retry_in_seconds=round(delay, 3),
+                )
+                await _wait(shutdown, delay)
+                continue
+
+            if consecutive_failures:
+                log.info("worker.recovered", after_failures=consecutive_failures)
+                consecutive_failures = 0
+
             if processed == 0:
-                # Waiting on the event rather than sleeping makes shutdown
-                # immediate instead of taking up to a full poll interval.
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(shutdown.wait(), timeout=settings.poll_interval_seconds)
+                await _wait(shutdown, settings.poll_interval_seconds)
     finally:
         await engine.dispose()
         log.info("worker.stopped")

@@ -1,0 +1,47 @@
+# Railway service: `app` (the ingestion API).
+#
+# This is the default config path, so the app service picks it up with no extra
+# setting. The worker reads `railway.worker.toml` instead -- see that file, and
+# `docs/deploy-railway.md` for the wiring.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Migrations run here and *only* here (the worker deliberately has no
+# preDeployCommand). Two services racing `alembic upgrade head` on the same
+# database is a real way to corrupt a schema, and it is the same reason Compose
+# runs `migrate` as a one-shot service rather than as an app startup step.
+#
+# The pre-deploy container has the private network and the service variables, and
+# a non-zero exit aborts the deploy -- so a migration that fails takes the release
+# with it instead of promoting an app onto a schema it cannot use.
+preDeployCommand = ["alembic upgrade head"]
+
+# /healthz, never /readyz. /readyz reports on the *database*, so a Postgres blip
+# would make Railway kill and reschedule a perfectly healthy container -- turning
+# a recoverable dependency wobble into an outage of our own making. Liveness asks
+# "is this process alive"; that is the only question a restart can answer.
+healthcheckPath = "/healthz"
+healthcheckTimeout = 30
+
+# The pre-deploy migration has to finish before the first health check lands, and
+# a cold start includes creating the connection pool.
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+# SIGTERM -> drain -> exit. uvicorn is PID 1 (see the `exec` in the Dockerfile
+# CMD), so it receives the signal and finishes in-flight requests. Without the
+# grace period, a rolling deploy would SIGKILL mid-request: the provider is told
+# 202 and the event never reaches the queue, which is the exact loss this service
+# exists to prevent.
+drainingSeconds = 30
+
+numReplicas = 1
+
+# Off, explicitly. A sleeping app wakes on inbound HTTP, so the *API* would in
+# principle survive it -- but a webhook provider does not retry patiently around
+# a cold start, and a delivery that times out is a delivery you have to be paid
+# back for later. The worker sets this for a far worse reason; see the other file.
+sleepApplication = false
