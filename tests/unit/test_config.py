@@ -111,3 +111,40 @@ class TestStrictness:
     def test_non_postgres_dsn_is_rejected(self) -> None:
         with pytest.raises(ValidationError):
             _settings(database_url="mysql://user:pw@localhost/db")
+
+
+class TestDatabaseDriver:
+    """A managed Postgres publishes a driverless DSN; this process is async-only.
+
+    Getting this wrong is a deploy that goes green and then fails on the first
+    webhook, because the sync driver is only resolved when a connection is opened.
+    """
+
+    def test_a_driverless_dsn_is_adapted_to_asyncpg(self) -> None:
+        # Exactly what Railway, Heroku and RDS hand you.
+        settings = _settings(database_url="postgresql://user:pw@db.internal:5432/railway")
+
+        assert str(settings.database_url).startswith("postgresql+asyncpg://")
+
+    def test_the_legacy_postgres_scheme_is_adapted_too(self) -> None:
+        settings = _settings(database_url="postgres://user:pw@db.internal:5432/railway")
+
+        assert str(settings.database_url).startswith("postgresql+asyncpg://")
+
+    def test_adapting_the_scheme_preserves_every_other_component(self) -> None:
+        settings = _settings(database_url="postgresql://u:p%40ss@db.internal:6543/railway")
+        dsn = str(settings.database_url)
+
+        assert "u:p%40ss@db.internal:6543" in dsn
+        assert dsn.endswith("/railway")
+
+    def test_an_explicit_asyncpg_dsn_is_left_alone(self) -> None:
+        settings = _settings(database_url=_DSN)
+
+        assert str(settings.database_url) == _DSN
+
+    def test_a_foreign_driver_is_refused_rather_than_overwritten(self) -> None:
+        # Silently substituting our own driver would be worse than refusing: the
+        # caller asked for something this process cannot do, and should hear so.
+        with pytest.raises(ValidationError, match="async-only"):
+            _settings(database_url="postgresql+psycopg2://user:pw@localhost:5432/db")
