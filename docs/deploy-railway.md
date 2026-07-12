@@ -95,6 +95,14 @@ Migrations run **here and nowhere else**. The worker has no pre-deploy command o
 purpose; two services racing `alembic upgrade head` against one database is a real
 way to corrupt a schema.
 
+Which means the worker has no ordering guarantee against the migration — the two
+services deploy at once, and on a cold start the worker gets there first and finds
+an empty database. It handles this itself: it logs `worker.awaiting_schema` and
+polls until the tables appear, then `worker.schema_ready`. Nothing for you to
+sequence. If the schema never arrives (a typo'd `DATABASE_URL`, a pre-deploy that
+was never wired up) it exits loudly after `schema_wait_timeout_seconds`, rather
+than sitting there looking healthy.
+
 ## Step 4 — The `worker` service
 
 1. **New → GitHub Repo →** the same repository again.

@@ -156,6 +156,19 @@ class Settings(BaseSettings):
         ),
     )
 
+    schema_wait_timeout_seconds: float = Field(
+        default=180.0,
+        gt=0,
+        description=(
+            "How long the worker waits at startup for the schema to appear before "
+            "giving up. The migration is the *app's* pre-deploy step and the worker "
+            "has no ordering guarantee against it -- on most platforms both services "
+            "deploy at once, so on a cold start the worker wins the race and finds no "
+            "tables. Bounded, because a schema that never arrives is a broken "
+            "deployment and not something to wait out forever."
+        ),
+    )
+
     poll_batch_size: int = Field(
         default=100,
         gt=0,
