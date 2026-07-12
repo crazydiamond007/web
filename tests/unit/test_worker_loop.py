@@ -32,6 +32,21 @@ if TYPE_CHECKING:
 from webhook_receiver.config import Settings
 
 
+@pytest.fixture(autouse=True)
+def _schema_already_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests are about the poll loop, not about startup.
+
+    `run()` now waits for the schema before it polls, and against the deliberately
+    unreachable DSN below that wait would run to its full timeout. The startup path
+    has its own suite, against a real database: tests/integration/test_worker_startup.py.
+    """
+
+    async def ready(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(main, "await_schema", ready)
+
+
 def _settings() -> Settings:
     return Settings(
         database_url="postgresql+asyncpg://u:p@unreachable.invalid:5432/db",

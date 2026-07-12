@@ -96,6 +96,35 @@ never going to catch this class of failure anyway.
 **Consequently, the health of this service is the depth of its queue, not the liveness of its
 processes.** That is worth saying out loud, because it is not what a default dashboard measures.
 
+## Addendum: waiting for the *schema* is a different problem
+
+The first Railway deploy found the other half of this, and it is worth separating carefully, because
+the obvious fix is the wrong one.
+
+The migration runs as the **app's** pre-deploy step. The worker is a different service, and the two
+deploy *concurrently* — so on a cold start the worker gets there first and finds an empty database.
+Its first poll raised `42P01` (undefined_table), which `is_retryable` correctly refuses to retry,
+so the worker died. Three times, on the real deploy, before the migration landed and a restart stuck.
+
+The tempting fix is to add `42P01` to the retryable set. That would be a mistake. A missing table at
+*runtime* means the schema was pulled out from under a running worker, and somebody needs to know
+that immediately; retrying it would convert a screaming failure into a silent one.
+
+The distinction is **startup versus runtime**, not *which SQLSTATE*. So `await_schema()` runs once,
+before the poll loop: it waits for the table to appear, and only then starts polling. A table that
+has not appeared *yet* is a migration in flight. A table that disappears *later* is still fatal.
+
+It is bounded (`schema_wait_timeout_seconds`, default 180s) and fatal at the bound, because a schema
+that never arrives is a broken deployment — a typo'd DSN, a pre-deploy command that was never wired
+up — and a worker that waited for it forever would be one more process quietly doing nothing.
+
+And it is a **steady poll, not a backoff**. The first draft reused `next_delay_seconds`, and the
+worker duly slept for a minute while the schema sat there waiting for it: by the sixth attempt the
+ceiling is 64 seconds. Backoff exists to stop a fleet stampeding a struggling downstream. Nothing
+here is struggling and nothing is being stampeded — `to_regclass` is one catalogue lookup, and the
+thing being waited for happens exactly once. Reaching for the backoff was pattern-matching, not
+thinking.
+
 ## What this cost to find
 
 `is_retryable()` returned `False` for `socket.gaierror`, which meant even the taxonomy would not have

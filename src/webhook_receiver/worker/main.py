@@ -17,9 +17,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
+from datetime import timedelta
+from typing import Final
 
 import structlog
 from prometheus_client import start_http_server
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from webhook_receiver.adapters import queue
@@ -37,6 +40,17 @@ from webhook_receiver.services.process import process_event
 log = structlog.get_logger(__name__)
 
 
+class SchemaNotReadyError(RuntimeError):
+    """The schema never arrived. A broken deployment, not a transient fault."""
+
+
+# The table `due_event_ids` selects from, and so the one whose absence makes every
+# poll fail. `to_regclass` answers NULL for a table that does not exist rather than
+# raising, which is what makes it usable as a probe.
+SCHEMA_PROBE_TABLE: Final = "webhook_event"
+_SCHEMA_PROBE: Final = text("SELECT to_regclass(CAST(:table AS text))")
+
+
 async def _wait(shutdown: asyncio.Event, seconds: float) -> None:
     """Sleep for `seconds`, or wake immediately if a shutdown is requested.
 
@@ -46,6 +60,77 @@ async def _wait(shutdown: asyncio.Event, seconds: float) -> None:
     """
     with contextlib.suppress(TimeoutError):
         await asyncio.wait_for(shutdown.wait(), timeout=seconds)
+
+
+async def await_schema(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    settings: Settings,
+    clock: Clock,
+    shutdown: asyncio.Event,
+) -> None:
+    """Block until the schema this worker's queries assume actually exists.
+
+    The migration runs as the *app's* pre-deploy step, and the worker has no
+    ordering guarantee against it. On most platforms the two services deploy
+    concurrently, so on a cold start the worker reliably wins the race and finds an
+    empty database.
+
+    Without this, that first poll raises 42P01 (undefined_table), which
+    `is_retryable` correctly refuses to retry -- a missing table is a bug, not
+    weather -- so the worker dies. It dies again on restart, and again, and if the
+    migration outlives the platform's restart budget (Railway allows 10) the worker
+    is permanently dead while the API carries on accepting events. The silent
+    dead-worker failure, arrived at from a new direction.
+
+    So the wait lives *here*, at startup, and deliberately not in the poll loop. A
+    table that vanishes at runtime still crashes the process, because that means
+    the schema was pulled out from under a running worker and somebody needs to
+    know. A table that has not appeared *yet*, on the other hand, is just a
+    migration that has not landed.
+
+    Bounded, and fatal at the bound: a schema that never arrives is a broken
+    deployment, and a worker that waited for it forever would be one more process
+    quietly doing nothing.
+
+    A steady poll, not the exponential backoff the retries use. The first draft
+    reused `next_delay_seconds`, and the worker duly slept for a minute while the
+    schema sat there waiting for it -- by the sixth attempt the ceiling is 64s.
+    Backoff exists to stop a fleet stampeding a struggling downstream; nothing here
+    is struggling and nothing is being stampeded. `to_regclass` is one index lookup
+    against a catalogue, and the thing being waited for happens exactly once.
+    """
+    deadline = clock.now() + timedelta(seconds=settings.schema_wait_timeout_seconds)
+    attempt = 0
+
+    while not shutdown.is_set():
+        try:
+            async with session_scope(factory) as session:
+                found = (
+                    await session.execute(_SCHEMA_PROBE, {"table": SCHEMA_PROBE_TABLE})
+                ).scalar()
+            if found is not None:
+                if attempt:
+                    log.info("worker.schema_ready", waited_attempts=attempt)
+                return
+        except Exception as exc:
+            # The database is not merely un-migrated, it is not up. Same wait, same
+            # reasoning -- and the same refusal to swallow anything unrecognised.
+            if not is_retryable(exc):
+                raise
+
+        if clock.now() >= deadline:
+            msg = (
+                f"table {SCHEMA_PROBE_TABLE!r} did not appear within "
+                f"{settings.schema_wait_timeout_seconds}s, so the migration has not run. "
+                f"Check that `alembic upgrade head` is wired as the app's pre-deploy "
+                f"command, and that the app and the worker share one DATABASE_URL."
+            )
+            raise SchemaNotReadyError(msg)
+
+        attempt += 1
+        log.info("worker.awaiting_schema", attempt=attempt)
+        await _wait(shutdown, settings.poll_interval_seconds)
 
 
 async def poll_once(
@@ -122,6 +207,10 @@ async def run(settings: Settings, shutdown: asyncio.Event) -> None:
             # Loud, because a seeded RNG in production is a correctness problem
             # that looks like nothing until the retries synchronise.
             log.warning("worker.jitter_seeded", seed=settings.jitter_seed)
+
+        # The migration is the app's pre-deploy step and the two services deploy at
+        # once, so on a cold start this worker gets here first and finds nothing.
+        await await_schema(factory, settings=settings, clock=clock, shutdown=shutdown)
 
         consecutive_failures = 0
 
