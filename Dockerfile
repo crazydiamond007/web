@@ -23,20 +23,22 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 # Dependencies change far less often than source. Installing them from the
-# lockfile alone keeps this layer cached across ordinary code edits.
+# lockfile alone keeps this layer cached across ordinary code edits, and that
+# layer cache -- not a mount -- is what makes an ordinary rebuild fast.
 #
-# The cache mount carries an explicit `id`. BuildKit defaults it to the target
-# path and is happy without one; Railway's Dockerfile parser is not, and rejects
-# the flag outright ("missing an id argument"). It is a plain literal because
-# Railway only *persists* a cache whose id is `s/<service id>-...` and forbids
-# variables in the id -- and `app` and `worker` are two different services sharing
-# this one Dockerfile, so no literal can be right for both. So Railway parses this
-# and then ignores the cache, which costs nothing: the layer cache above already
-# covers the common case, and this mount only earns its keep on a local rebuild
-# after the lockfile moves.
+# No `--mount=type=cache` here, deliberately, and it took two attempts to accept
+# that. BuildKit is happy with a bare cache mount. Railway's parser demands an
+# `id`, and then demands that the id carry an `s/<service id>-` prefix, and then
+# forbids variables in it. `app` and `worker` are two services built from this one
+# Dockerfile, so there is no literal id that is correct for both: the constraint
+# is unsatisfiable without forking the Dockerfile per service.
+#
+# Which is a bad trade for what the mount actually bought. It only ever helped on
+# a *local* rebuild after `uv.lock` moved -- CI runners are ephemeral, so the mount
+# never survived a job there either. That is worth a few seconds of re-downloaded
+# wheels, and not worth a second Dockerfile.
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+RUN uv sync --frozen --no-install-project --no-dev
 
 COPY src/ ./src/
 COPY migrations/ ./migrations/
@@ -45,8 +47,7 @@ COPY alembic.ini ./
 # build the project without it. Copied here rather than into the layer above, so
 # it cannot invalidate the cached dependency install.
 COPY LICENSE ./
-RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev
 
 # --- Stage 2: runtime ---------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
